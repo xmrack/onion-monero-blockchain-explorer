@@ -656,3 +656,81 @@ indexing of the out-parameter are both verified directly in this repository. The
 monero's `src/ringct/rctSigs.cpp`, which is not vendored in this checkout —
 confirm them against the monero tree the explorer is built against
 (`v0.18.4.0` per the Dockerfile) before filing upstream.
+
+---
+
+# 22. `*min_element()` on an empty vector — null dereference on the tx page — CRITICAL
+
+**Where:** `src/page.h:6641-6642` in `construct_mstch_mixin_timescales()`.
+
+```cpp
+for (const vector<uint64_t>& mixn_timestamps : mixin_timestamp_groups)
+{
+    uint64_t min_found = *min_element(mixn_timestamps.begin(), mixn_timestamps.end());
+    uint64_t max_found = *max_element(mixn_timestamps.begin(), mixn_timestamps.end());
+```
+
+`min_element`/`max_element` return `end()` for an empty range, and dereferencing
+that is undefined behaviour. For a `std::vector` that was never written to,
+`begin() == end() == nullptr`, so this is a straight **null pointer dereference**
+— a segfault, not an exception, so Crow's worker-loop `catch (std::exception&)`
+does not contain it. The process dies.
+
+Nothing in either caller filters empty groups out, and two independent paths
+produce them:
+
+### Path 1 — `/tx/<hash>`, no pusher required
+
+`src/page.h:2413-2437`: the per-ring-member loop `break`s out on the **first**
+`OUTPUT_DNE` from `get_output_tx_and_index`:
+
+```cpp
+for (const uint64_t& abs_offset: absolute_offsets)
+{
+    ...
+    catch (const OUTPUT_DNE& e) { cerr << out_msg << '\n'; break; }
+    ...
+    mixin_timestamps.push_back(blk.timestamp);   // never reached
+}
+mixin_timestamp_groups.push_back(mixin_timestamps);   // pushed anyway — empty
+```
+
+The earlier failure modes in that loop use `continue`, which skips the
+`push_back` and is safe. This one uses `break`, which falls through to it. So an
+input whose *first* ring member fails to resolve — the exact condition the
+neighbouring `are_absolute_offsets_good()` helper exists to detect, and which the
+`MDB_NOLOCK` reader of finding 9 makes more likely — appends an empty group.
+
+This is the ordinary transaction page. It needs only `--enable-mixin-details`
+(the `detailed_view` guard at `src/page.h:6500`), not the pusher.
+
+### Path 2 — `/checkandpush`, fully attacker-controlled
+
+`src/page.h:2965-3040`: `mixin_timestamps` is filled by iterating
+`tx_source.outputs`. That vector comes out of the attacker's deserialised blob,
+so an attacker who submits a `tx_source` with an **empty `outputs`** produces an
+empty group directly, with no dependence on chain state. One unauthenticated POST,
+deterministic crash.
+
+**Impact:** unauthenticated remote denial of service that kills the process, on a
+default-ish configuration. Trivially repeatable — there is no partial-failure or
+race dependence in path 2.
+
+**Fix:** skip empty groups in the min/max loop (and drop them from
+`mixin_timestamp_groups` so the timescale array stays aligned with
+`real_output_indices`), or use the range overloads and handle the empty case.
+
+### Correction to finding 6
+
+I gave "a `tx_source` with an empty `outputs` vector" as the trigger for the
+out-of-bounds write in `mark_real_mixins_on_timescales`. That is the same input
+as path 2 here — and this null dereference happens **first**, inside
+`construct_mstch_mixin_timescales`, which runs at `src/page.h:3054` before
+`mark_real_mixins_on_timescales` at `src/page.h:3068`. So on that specific input
+the process dies here and never reaches the OOB write.
+
+Finding 6 stands as written — `*(r.begin())` is dereferenced unguarded on every
+"not found" result from `boost::find_nth`, not only the underflow case — but its
+reachability via the empty-`outputs` route is blocked by this bug, and fixing
+this one un-blocks it. They must be fixed together, and finding 6 should not be
+closed on the grounds that its trigger "just crashes anyway".
