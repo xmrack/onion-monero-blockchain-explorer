@@ -552,3 +552,107 @@ write (6), and full disclosure of the most sensitive secret the service handles
 (7, 8). 9 and 10 are serious robustness defects with security consequences.
 11–18 are genuine bugs whose exploitability is limited by reachability, and I
 have not classified them as critical because the code does not support that claim.
+
+---
+
+# 21. Integer truncation splits the bounds check from the write target — CRITICAL
+
+**This supersedes finding 3, which I under-classified as an out-of-bounds *read*.
+It is an out-of-bounds *write*, and the guard that should stop it is bypassed by a
+32-bit truncation.**
+
+**Where:** `src/page.h:3973-3985` (`POST /checkrawoutputkeys`), with the signature
+at `src/tools.h:246-251`.
+
+```cpp
+bool decode_ringct(const rct::rctSig & rv,
+                   const crypto::public_key pub,
+                   const crypto::secret_key &sec,
+                   unsigned int i,          // <-- 32-bit
+                   rct::key & mask,         // <-- non-const: this is an OUT parameter
+                   uint64_t & amount);
+```
+
+```cpp
+bool r = decode_ringct(tx.rct_signatures,
+                       tx_pub_key,
+                       prv_view_key,
+                       td.m_internal_output_index,                               // (A)
+                       tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask, // (B)
+                       xmr_amount);
+```
+
+`td.m_internal_output_index` is a `uint64_t` deserialised straight from the
+attacker's blob. It is used **twice, at two different widths**:
+
+* **(A)** is passed as `unsigned int i` — silently **truncated to its low 32 bits**.
+* **(B)** indexes `std::vector<rct::ecdhTuple>` with the **full 64 bits**, and the
+  resulting reference is the function's *output* parameter.
+
+Monero's `rct::decodeRctSimple` opens with
+`CHECK_AND_ASSERT_THROW_MES(i < rv.ecdhInfo.size(), "Bad index")` and later
+performs `mask = ecdh_info.mask;`. So **the value that is validated and the value
+that selects the memory being written are different numbers.** The bounds check
+guards `i`; the write goes through a reference the caller already computed from
+the untruncated index.
+
+### The two primitives, from one field
+
+**Out-of-bounds write.** Set `m_internal_output_index = 0x0000_0001_0000_0000`.
+The truncated `i` is `0`, which passes `0 < ecdhInfo.size()`, so no exception is
+thrown — and then 32 bytes are written to
+`ecdhInfo.data() + 0x1_0000_0000 * sizeof(ecdhTuple)`. The high 32 bits are free,
+so the displacement is any multiple of 2^32 × 64 = 256 GiB.
+
+**Arbitrary-offset read with a response-visible oracle.** Make the truncated `i`
+*invalid* instead (low 32 bits ≥ `ecdhInfo.size()`). The first call now throws
+inside monero, is swallowed by `catch (...)` in `decode_ringct`
+(`src/tools.cpp:974`), and returns `false` — which means `r == false`, so the
+`r = r || decode_ringct(...)` short-circuit **does** evaluate the second call.
+That one reads `additional_tx_pub_keys[td.m_internal_output_index]` **by value**
+with no truncation and no check anywhere: a 32-byte read at `base + 32 * k` for
+any attacker-chosen `k`. The bytes become `pub`, are fed to
+`generate_key_derivation`, and whether that succeeds — plus any decoded amount —
+is reflected in the response. That is a byte-granular probe of process memory.
+
+Both are reachable in a single unauthenticated POST. The attacker supplies the
+view key that authenticates their own blob, so nothing about this requires a
+victim.
+
+### Impact
+
+Remote, unauthenticated, attacker-directed **memory corruption**, plus an
+arbitrary-offset read oracle over the same address space that holds other users'
+submitted view keys. A segmentation fault is *not* a C++ exception, so Crow's
+worker-loop `catch (std::exception&)` (`ext/crow_all.h:11045`) does not contain
+it — unlike most other findings in this report, this one kills the process.
+
+**Honest scoping of the write:** because the displacement is quantised to 256 GiB
+steps, an attacker cannot practically aim it at a chosen heap object on 64-bit —
+in nearly all cases it lands unmapped and the process dies. So the dependable
+outcome is a guaranteed remote crash, with the *read* primitive being the
+precisely controllable one. I am not claiming a demonstrated path to code
+execution. It is still the most serious issue in this report: it is the only
+finding that writes to attacker-chosen memory, and it defeats an upstream bounds
+check that was put there specifically to prevent this.
+
+### Fix
+
+```cpp
+if (td.m_internal_output_index >= tx.rct_signatures.ecdhInfo.size())
+    { /* error out */ }
+if (td.m_internal_output_index >= additional_tx_pub_keys.size())
+    { /* skip the additional-key attempt */ }
+```
+
+and widen `decode_ringct`'s `unsigned int i` to `uint64_t` (or `size_t`) at
+`src/tools.h:250` and `src/tools.cpp:917`/`938` so that no call site can ever
+validate a different value than it dereferences. The width mismatch is the root
+cause; the missing bounds check is what makes it reachable.
+
+**Verification note:** the truncation (`unsigned int i`) and the full-width
+indexing of the out-parameter are both verified directly in this repository. The
+`CHECK_AND_ASSERT_THROW_MES` guard and the `mask = ecdh_info.mask` write are from
+monero's `src/ringct/rctSigs.cpp`, which is not vendored in this checkout —
+confirm them against the monero tree the explorer is built against
+(`v0.18.4.0` per the Dockerfile) before filing upstream.
