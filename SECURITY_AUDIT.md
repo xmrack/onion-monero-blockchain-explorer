@@ -1,6 +1,6 @@
 # Security audit — onion-monero-blockchain-explorer
 
-Full review of every source file in the tree, plus a second verification pass over
+Full review of every source file in the tree, plus two further verification passes over
 each finding. Findings are ordered by severity and numbered stably: the numbers are
 the ones used in the commit history, so they are not renumbered here even though the
 order has changed.
@@ -44,6 +44,8 @@ were.
 | [27](#27) | `.at(0)` and unsigned underflow in JSON helpers | Low — dead code |
 | [28](#28) | Ignored `parse_hash256` result | Low — dead code |
 | [20](#20) | Footer template re-read from disk per request | Low |
+| [31](#31) | `blk_no - 1` underflows before first emission scan | Low |
+| [32](#32) | `enable_pusher` not re-checked on raw-hex push path | Low — latent |
 | ~~3~~ | *Superseded by 21* | — |
 
 **Seven findings are critical.** All are remotely reachable by an unauthenticated
@@ -666,6 +668,32 @@ render instead of using the cached `template_file` map that every other template
 goes through — synchronous file I/O in the request path, unauthenticated and
 unthrottled.
 
+<a name="31"></a>
+## 31. `blk_no - 1` underflows before the first emission scan completes
+
+`src/page.h:838`, `5858`, `5863`. `CurrentBlockchainStatus` initialises
+`total_emission_atomic = Emission {0, 0, 0}` (`src/CurrentBlockchainStatus.cpp:26`),
+and the `/api/emission` and front-page renderers are guarded only by
+`is_thread_running()`, not by whether a scan has produced a result. In the window
+between the thread starting and the first `update_current_emission_amount()`
+completing, `blk_no` is 0 and `blk_no - 1` wraps to `18446744073709551615`, which is
+reported as the emission block height. Correctness only — no memory unsafety.
+**Fix:** report 0, or gate on `blk_no > 0`.
+
+<a name="32"></a>
+## 32. `enable_pusher` not re-checked on the raw-hex push path — latent
+
+`src/page.h:3448-3455` vs `3477-3487`. `show_pushrawtx()` checks
+`if (this->enable_pusher == false)` only inside the base64/`signed_tx_set` branch.
+The first branch — which accepts `raw_tx_data` as a plain hex tx blob, pushes it into
+`ptx_vector` and falls through to the `commit_tx` loop — performs no such check.
+
+**Not currently reachable:** `/checkandpush` and `/rawtx` are registered inside
+`if (enable_pusher)` in `main.cpp:530`, so with pushing disabled the route returns
+404 and the function is never entered. The in-function check is defence in depth, and
+it is simply absent on one of the two paths. Worth restoring so the guard does not
+depend solely on route registration.
+
 ---
 
 # Negative results
@@ -699,6 +727,28 @@ Checked and found **not** vulnerable. Recorded so they are not re-audited.
   (`main.cpp:108-111` overrides `--enable-randomx` to `false`), so `show_randomx`
   returns early and none of this file is reachable. Not audited in depth for that
   reason — revisit if RandomX is re-enabled.
+* **Attacker-supplied tx blobs reaching `ecdhInfo[output_idx]`** (`src/page.h:2277`,
+  `5469`, `6021`): `/myoutputs` accepts a `raw_tx_data` hex blob and reconstructs a
+  transaction from it (`src/page.h:2003-2035`) that never passes consensus
+  validation, so a `vout`/`ecdhInfo` size mismatch looked possible. It is not, for
+  two independent reasons. Monero's RCT deserialiser enforces
+  `ecdhInfo.size() == vout.size()` while parsing (`serialize_rctsig_base`), so the
+  mismatch cannot be constructed through a blob at all; and even if it could, the
+  index passed to `decode_ringct` and the index used to form the `mask` reference are
+  **the same value** here, so monero's internal `CHECK_AND_ASSERT_THROW_MES(i <
+  rv.ecdhInfo.size())` fires before any access. This is precisely the guard that
+  finding 21 defeats by truncating one of the two — the contrast is what makes 21's
+  root cause the *width mismatch* rather than the missing bounds check. (The
+  deserialiser behaviour is from monero's source, not vendored here — verify against
+  the build tree.)
+* **`template_file` concurrent map access** (`src/page.h:519`): the map is populated
+  in the constructor and read from request handlers via `operator[]`, which inserts
+  on a missing key — concurrent insertion would corrupt the tree. Every key looked up
+  anywhere in the file is assigned in the constructor (verified by diffing the two
+  sets), so no insertion ever occurs. The one variable-key lookup, `get_js_file`
+  (`src/page.h:4414-4419`), guards with `.count()` first and has no callers.
+* **`found_txs.at(0)`** (`src/page.h:1356`, `2048`, `4359`, `4368`, `6115`, `7062`):
+  every site is preceded by a `!found_txs.empty()` check whose else-branch returns.
 * **Docker:** the final image drops to a non-root `monero` user
   (`Dockerfile:76-78`).
 
