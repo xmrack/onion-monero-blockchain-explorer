@@ -734,3 +734,205 @@ Finding 6 stands as written — `*(r.begin())` is dereferenced unguarded on ever
 reachability via the empty-`outputs` route is blocked by this bug, and fixing
 this one un-blocks it. They must be fixed together, and finding 6 should not be
 closed on the grounds that its trigger "just crashes anyway".
+
+---
+
+# File-by-file review
+
+Every source file in the repository, read in full rather than grepped. Files with
+no new findings are recorded too — a clean file is a result.
+
+| File | Lines | Outcome |
+|---|---|---|
+| `main.cpp` | 919 | findings 1, 16 |
+| `src/CmdLineOptions.cpp` / `.h` | 122 / 37 | no memory-safety issues; note below |
+| `src/MicroCore.cpp` | 317 | finding 9 |
+| `src/MicroCore.h` | 92 | clean |
+| `src/CurrentBlockchainStatus.cpp` | 322 | findings 12, 13 |
+| `src/CurrentBlockchainStatus.h` | 114 | clean |
+| `src/MempoolStatus.cpp` | 365 | finding 8 |
+| `src/MempoolStatus.h` | 175 | finding 8 (buffers), finding 23 below |
+| `src/rpccalls.cpp` | 436 | findings 19, 25, 26 below |
+| `src/rpccalls.h` | 205 | clean |
+| `src/tools.cpp` | 1320 | findings 11, 14, 27, 28 below |
+| `src/tools.h` | 388 | finding 21 (the `unsigned int i` parameter) |
+| `src/page.h` | 7178 | findings 2–7, 10, 15, 20, 21, 22, 24 below |
+| `src/crypto/rx-slow-hash.c` | 512 | unreachable — see below |
+| `src/monero_headers.h`, `version.h.in` | 45 / 14 | clean |
+| `templates/*.html` | — | no XSS found; see negative results |
+| `Dockerfile`, `CMakeLists.txt` | — | finding 18 |
+
+## 23. `return 0;` from a `std::string` function — LOW (dead code)
+
+**Where:** `src/MempoolStatus.h:102-113`.
+
+```cpp
+static string
+get_status_string(const uint64_t& status)
+{
+    if (status == 1) return CORE_RPC_STATUS_OK;
+    if (status == 2) return CORE_RPC_STATUS_BUSY;
+    // default
+    return 0;              // <-- null pointer constant -> std::string(nullptr)
+}
+```
+
+`0` is a null pointer constant, so this selects `std::string(const char*)` with
+`nullptr` — the same undefined behaviour as finding 1, reached whenever the
+daemon reports a status that is neither `OK` nor `BUSY` (i.e. whenever
+`get_status_uint` returns its `0` default). It is **not** currently exploitable:
+`get_status_string` has no callers anywhere in the tree. Worth fixing before
+someone wires it up, since the wrong-status path is exactly the one a caller
+would hit first.
+
+## 24. Two attacker-controlled halves of one blob indexed against each other — HIGH
+
+**Where:** `src/page.h:3285` and `src/page.h:3369` (`POST /checkandpush`, signed-tx path).
+
+```cpp
+mstch::map tx_context = construct_tx_context(ptx.tx, 1);   // sized by ptx.tx.vin / .vout
+...
+for (tx_destination_entry& a_dest: ptx.construction_data.splitted_dsts)
+    real_ammounts.push_back(...);                          // sized by construction_data
+...
+for (size_t i = 0; i < outputs.size(); ++i)
+    out_amount_str = xmreg::xmr_amount_to_str(real_ammounts.at(i));   // (a)
+...
+for (mstch::node& input_node: inputs)
+    amount = xmreg::xmr_amount_to_str(real_amounts.at(input_idx));    // (b)
+```
+
+`ptx.tx` and `ptx.construction_data` are **independent fields of the same
+attacker-supplied `tools::wallet2::pending_tx`**, and nothing cross-validates
+them. `outputs`/`inputs` are sized from the transaction; `real_ammounts`/
+`real_amounts` are sized from the construction data. Submitting a `pending_tx`
+whose `tx` has five inputs and whose `construction_data.sources` is empty makes
+(b) throw `std::out_of_range` on the first iteration; the mismatch for (a) is
+arranged just as easily and is reached for every RingCT output (their amount
+string is `0.000000000`, so `output_amount == 0` holds).
+
+This differs from finding 10, where the mismatch was between a container sized by
+the *database* and one sized by the *transaction*. Here both sides come from the
+attacker, in the same blob, so no chain state or timing is needed — it is a
+deterministic one-request trigger.
+
+**Impact:** per finding 10, an escaping exception abandons the request without
+completing the response, hanging the client connection and leaking worker
+capacity. High rather than critical because it does not kill the process.
+
+**Fix:** validate `ptx.tx.vin.size() == ptx.construction_data.sources.size()` and
+`ptx.tx.vout.size() == ptx.construction_data.splitted_dsts.size() + 1` before
+rendering, and reject the blob otherwise.
+
+## 25. RPC calls that can hang while holding the shared daemon mutex — MEDIUM
+
+**Where:** `src/rpccalls.cpp:205`, `269`, `330`, `385`.
+
+`get_current_height` and `get_mempool` pass `timeout_time_ms` to
+`invoke_http_json`. `get_network_info`, `get_hardfork_info`,
+`get_dynamic_per_kb_fee_estimate` and `get_block` **omit it**, taking epee's
+default instead — and all four hold `m_daemon_rpc_mutex` across the call.
+
+`get_dynamic_per_kb_fee_estimate` is reachable from a request handler
+(`/api/feeestimate` → `src/page.h:5807`), so a daemon that accepts the connection
+and then stalls parks a Crow worker thread *and* the shared RPC mutex for the
+default timeout, blocking every other RPC user behind it. The explorer already
+computed a `timeout_time_ms` for exactly this purpose; these four call sites just
+don't use it.
+
+**Fix:** pass `timeout_time_ms` at all call sites.
+
+## 26. Daemon RPC transport security hardcoded off — MEDIUM
+
+**Where:** `src/rpccalls.cpp:24-27`.
+
+```cpp
+m_http_client.set_server(daemon_url, login,
+        epee::net_utils::ssl_support_t::e_ssl_support_disabled);
+```
+
+TLS to the daemon is disabled unconditionally, with no command-line option to
+enable it — while `--daemon-login user[:password]` exists and `--daemon-url`
+accepts a remote host. So credentials and every byte of blockchain data cross the
+network in the clear whenever the daemon is not on localhost.
+
+This matters beyond confidentiality: findings 8 and 14 both depend on
+daemon-supplied values, and this makes those values controllable by anyone on the
+path, not just by the daemon operator.
+
+**Fix:** expose the ssl support mode as an option, defaulting to enabled for
+non-loopback daemon URLs.
+
+## 27. Unreachable JSON helpers with `.at(0)` and unsigned underflow — LOW (dead code)
+
+**Where:** `src/tools.cpp:450` and the surrounding `json`-overload family.
+
+```cpp
+mixin_no = _json["vin"].at(0)["key"]["key_offsets"].size() - 1;
+```
+
+`.at(0)` throws `json::out_of_range` on a transaction with no inputs (a coinbase
+tx), and `.size() - 1` underflows to `UINT64_MAX` when `key_offsets` is empty.
+The `.get<uint64_t>()` calls in the same family throw `json::type_error` on a
+missing or wrongly-typed field, and in the `string` overloads that happens
+*outside* the `try` block, which only guards `json::parse`.
+
+Not currently reachable: both live call sites (`src/page.h:6706`,
+`src/MempoolStatus.cpp:183`) use the `transaction` overload, not the `json` one.
+The whole `json`-based family is dead.
+
+## 28. Ignored `parse_hash256` result — LOW (dead code)
+
+**Where:** `src/tools.cpp:57`.
+
+```cpp
+crypto::hash tx_hash;
+parse_hash256(hash_str, tx_hash);   // return value ignored
+tx = core_storage.get_db().get_tx(tx_hash);
+```
+
+On a parse failure `tx_hash` is left uninitialised and is then used as a database
+key. `get_tx_pub_key_from_str_hash` has no callers; dead code.
+
+## Negative results
+
+Things that looked wrong and are not — recorded so they don't get re-audited:
+
+* **`timestamps_time_scale` off-by-one** (`src/tools.cpp:908`):
+  `empty_time[timestamp_place + 1]` looks like a classic one-past-the-end write,
+  but the caller pads the range by ±3600 seconds
+  (`src/page.h:6650-6651`), so `timestamp < timeN` strictly and
+  `timestamp_place ≤ 168` against a 170-char buffer. Not reachable. The same
+  padding makes `interval_length` non-zero, so the division cannot produce
+  `NaN`/`inf` either.
+* **`get_tx_details` coinbase check** (`src/page.h:6720`): `tx.vin.at(0)` is
+  correctly guarded by `tx.vin.size() > 0` on the preceding line.
+* **`additional_derivations[output_idx]`** (`src/page.h:2243`, `5443`, `6001`):
+  properly gated on
+  `txd.additional_pks.size() == txd.output_pub_keys.size()`. This is the check
+  whose absence would have been a serious OOB read, and it is present at all
+  three sites.
+* **`xmreg::decrypt`** (`src/tools.cpp:1053`): the `prefix_size` arithmetic is
+  correctly bounds-checked before the chacha20 call; source and destination
+  ranges stay inside their buffers.
+* **`url_decode`** (`src/tools.cpp:984`): the `%XX` lookahead is correctly
+  guarded by `i + 3 <= in.size()`.
+* **XSS:** all reflected values reach templates through mstch `{{ }}`, which
+  HTML-escapes, and user input additionally passes `remove_bad_chars`
+  (`src/tools.h:345`) restricting it to `[A-Za-z0-9+/=]`. The two `{{{ }}}`
+  unescaped interpolations (`templates/index.html:16`, `index2.html:65`) are fed
+  server-generated HTML from `mempool()`, not user input. No XSS found.
+* **`src/crypto/rx-slow-hash.c`**: RandomX is force-disabled at startup
+  (`main.cpp:108-111` overrides `--enable-randomx` to `false`), so
+  `show_randomx` returns early and none of this file is reachable. Not audited
+  in depth for that reason.
+* **Docker**: the final image drops to a non-root `monero` user
+  (`Dockerfile:76-78`). Good.
+
+## Note on `--daemon-login`
+
+`src/CmdLineOptions.cpp:73` takes `username[:password]` as a command-line
+argument, so the daemon RPC password is visible in `ps` output and
+`/proc/<pid>/cmdline` to every local user. Combined with finding 26 (no TLS),
+these credentials are not well protected at either end. Conventional for this
+class of tool, but worth an environment-variable or file-based alternative.
