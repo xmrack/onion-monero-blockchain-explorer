@@ -600,11 +600,22 @@ unauthenticated and unthrottled. **Fix:** cap the body size and the
 ## 18. Build produces no hardening and no optimisation
 
 `Dockerfile:53` (`RUN cmake .. && make`), `CMakeLists.txt`. No `CMAKE_BUILD_TYPE` is
-set, so the shipped binary has no optimisation and none of `-D_FORTIFY_SOURCE=2`,
-`-fstack-protector-strong`, `-fPIE`/`-pie` or `-Wl,-z,relro,-z,now`. The only flags
-present are Windows-specific (`CMakeLists.txt:12`). Not a vulnerability in itself,
-but it is what turns findings 2–5 and 21 from "aborts on a fortify check" into
-usable primitives. **Fix:** set `CMAKE_BUILD_TYPE=Release` and add hardening flags.
+set, so the shipped binary is built at `-O0`.
+
+**Narrowed by PoC.** I originally wrote that the binary has *none* of
+`-D_FORTIFY_SOURCE=2`, `-fstack-protector-strong`, `-fPIE`/`-pie` or
+`-Wl,-z,relro,-z,now`. That was wrong: Ubuntu's gcc — the Dockerfile's base image —
+enables stack-protector, PIE and RELRO **by default**, so a bare `cmake ..` still
+gets them. `poc/micro/f18_hardening.sh` measures it: stack-protector, PIE and RELRO
+are present at both `-O0` and `-O2`.
+
+What the missing `CMAKE_BUILD_TYPE` actually costs is `_FORTIFY_SOURCE`, which glibc
+makes a no-op without optimisation — **0 fortified `__*_chk` calls emitted at `-O0`
+versus 6 at `-O2`**, same source, same flags — plus all optimisation. So the fortify
+layer that would catch several of the over-reads in this report is absent, but the
+binary is not the unmitigated target I first described.
+
+**Fix:** set `CMAKE_BUILD_TYPE=Release`, which restores the fortify layer for free.
 
 <a name="25"></a>
 ## 25. RPC calls that can hang while holding the shared daemon mutex
@@ -1026,7 +1037,7 @@ weight:
 
 ## What the PoCs changed
 
-Three findings moved, all because running the code contradicted reading it:
+Four findings moved, all because running the code contradicted reading it:
 
 1. **Finding 1: Critical → High.** libstdc++ throws instead of segfaulting, so crow
    catches it and the process survives. My original rating assumed `strlen(nullptr)`.
@@ -1038,18 +1049,35 @@ Three findings moved, all because running the code contradicted reading it:
    with the direct disclosure channel, this is now the highest-exposure finding.
 3. **Finding 14: Medium → Low.** The claimed out-of-bounds read into glibc's name
    arrays cannot happen, because no format string in the codebase uses `%b` or `%a`.
+4. **Finding 18: narrowed.** Ubuntu's gcc supplies stack-protector, PIE and RELRO by
+   default, so the binary is not unmitigated as I wrote. The real cost of the missing
+   `CMAKE_BUILD_TYPE` is `_FORTIFY_SOURCE` (inactive at `-O0`) and optimisation.
 
-## Not reproduced, and why
+## Coverage
 
-* **2** — needs monero's `crypto::generate_signature` to authenticate the blob. No
-  standalone PoC is meaningful; the practical route is `export_outputs` from a wallet
-  whose view key you control, then truncating the plaintext to one byte.
-* **10, 24, 30** — the abandoned-request behaviour needs a live crow instance. The
-  underlying throw is covered by the finding-13 case.
-* **9, 18, 20, 25, 26** — configuration and structural; visible by reading, with no
-  behaviour to trigger.
-* **6, 19, 22 (reachability), 23, 27, 28, 32** — refuted or dead code. The mechanism
-  PoCs show the defects are real; no reachable trigger exists.
+All 32 findings now have a PoC; the per-finding table is in
+[`poc/README.md`](poc/README.md). Additional executed results beyond those listed
+above:
+
+| Finding | Result |
+|---|---|
+| 2 | ASan `READ of size 64`, `0 bytes after 21-byte region` — the 64-byte `reinterpret_cast` over-reads a 20-byte plaintext. The monero signature is only the endpoint's *gate*; the defect reproduces standalone. |
+| 6 | The `SIZE_MAX` clamp is reached, the search fails, and the write through the end iterator destroys the terminator: `strlen(c_str()) == 171` against `size() == 170`. The control case confirms `no_points >= 1` always succeeds — the reachability argument in the finding. |
+| 9 | **751206 torn/inconsistent reads without a reader lock, 0 with**, over the same workload. |
+| 10 | The throw is caught by the modelled worker loop and `response_completed` stays `false` — the process survives, the connection does not. |
+| 18 | **Corrected** — see the finding. 0 fortified calls at `-O0` vs 6 at `-O2`; stack-protector/PIE/RELRO present either way. |
+| 19 | Peak 8 concurrent users of one client without the mutex, 1 with. Concurrent `std::string` assignment intermittently throws `std::length_error: basic_string::_M_create` — the race is real but nondeterministic. |
+| 20 | 20000 renders: 233.60 ms re-reading from disk vs 0.02 ms from the cached map. |
+| 23 | `return 0;` throws `std::logic_error`, matching finding 1's corrected behaviour. |
+| 24 | The two independently sized halves make `.at()` throw on the first iteration. |
+| 25 | The untimed call holds the shared mutex 600 ms; the timed call behind it waits 630 ms. |
+| 26 | A plaintext daemon stub (`poc/http/f26_f08_f14_hostile_daemon.py`) serves `block_size_limit = 2048000000`, which formats to exactly 10 characters — the input finding 8 needs — plus an unrepresentable `start_time` for finding 14. |
+| 28, 30, 32 | Ignored return value leaves indeterminate lookup bytes; `has_error` set then an empty block used (age 55.5 years); hex branch reaches commit with the check skipped. |
+
+Seven findings (6, 19, 22, 23, 27, 28, 32) have working mechanism PoCs but **no
+reachable trigger** in the shipped code. The PoC proves the defect is real; the
+reachability analysis in each finding explains why it cannot currently be driven.
+That distinction is the point of separating the two tiers.
 
 ---
 

@@ -47,18 +47,47 @@ integer fields inside a genuine `unsigned_monero_tx` exported by
 `monero-wallet-cli`, which keeps the archive's class-version header valid — the only
 real gate on that endpoint, since `/checkandpush` applies no signature or encryption.
 
-## Findings with no PoC here, and why
+## Coverage — all 32 findings
 
-* **9** (`MDB_NOLOCK`), **18** (build flags), **25**, **26** (RPC transport), **20** —
-  configuration and structural findings; the code reads them directly, there is no
-  behaviour to trigger.
-* **10**, **24**, **30** — need a live build to observe the abandoned-request
-  behaviour; the exception mechanism is covered by `f_misc.cpp`'s finding-13 case.
-* **2** — needs monero's `crypto::generate_signature` to authenticate the blob. The
-  practical route is `export_outputs` from a wallet whose view key you control, then
-  truncate the plaintext; no standalone PoC is meaningful without the monero crypto.
-* **6**, **19**, **22** (reachability), **23**, **27**, **28**, **32** — refuted or
-  dead code. The mechanism PoCs above show the defect; reachability does not exist.
+| # | PoC | Tier | Observed |
+|---|---|---|---|
+| 1 | `f01_null_queryparam.cpp`, `http/f01_search_crash.sh` | both | guard/read disagree; libstdc++ throws (exit 134) |
+| 2 | `f02_header_len.cpp` | micro | ASan `READ of size 64`, `0 bytes after 21-byte region` |
+| 3 | *(superseded by 21)* | — | see `f21_truncation.cpp` |
+| 4 | `f04_f05_oob_read.cpp`, `f04c_arbitrary.cpp`, `http/f04_*` | both | ASan OOB read; **exact secret recovery** at a chosen offset |
+| 5 | `f04_f05_oob_read.cpp`, `http/f04_f05_f24_pusher.py` | both | same primitive, 72-byte element confirmed |
+| 6 | `f06_timescale_write.cpp` | micro | `SIZE_MAX` clamp, terminator destroyed, `strlen 171 > size 170` |
+| 7 | `http/f07_viewkey_leak.sh` | http | view key in the shortcut URL |
+| 8 | `f_misc.cpp`, `http/f26_f08_f14_hostile_daemon.py` | both | no NUL written; `string{buf}.size()==38`; daemon serves the trigger value |
+| 9 | `f09_nolock.cpp`, `http/f09_torn_reads.sh` | both | **751206 torn reads** without a lock vs **0** with |
+| 10 | `f10_f24_f25.cpp` | micro | "Worker Crash" caught; `response_completed = false` |
+| 11 | `f_misc.cpp` | micro | negative index; glibc agrees either way (benign) |
+| 12 | `f_misc.cpp` | micro | `height-gap = 18446744073709551615` |
+| 13 | `f_misc.cpp` | micro | `out_of_range` escapes a `bad_lexical_cast` handler |
+| 14 | `f_misc.cpp`, `http/f26_*` | both | `gmtime_r` NULL; garbage date — **no OOB** (only `%F`/`%T` used) |
+| 15 | `f_misc.cpp` | micro | **SIGFPE** (exit 136) |
+| 16 | `http/f16_csrf.html` | http | auto-submitting cross-origin POST |
+| 17 | `http/f17_amplification.sh` | http | payload size vs response time, no ceiling |
+| 18 | `f18_hardening.sh` | micro | **corrected**: 0 fortified calls at `-O0` vs 6 at `-O2`; PIE/RELRO/protector present either way |
+| 19 | `f19_f20.cpp` | micro | peak 8 concurrent users of one client unlocked, 1 locked |
+| 20 | `f19_f20.cpp` | micro | 233.60 ms vs 0.02 ms for 20000 renders |
+| 21 | `f21_truncation.cpp` | micro | guard passes on truncated index, write **SIGSEGVs** at +256 GiB |
+| 22 | `f_misc.cpp` | micro | `min_element` on empty returns `end()`, `begin()==end()==nullptr` |
+| 23 | `f23_f28_f30_f32.cpp` | micro | `return 0;` throws `std::logic_error` |
+| 24 | `f10_f24_f25.cpp` | micro | independently sized halves; `.at()` throws immediately |
+| 25 | `f10_f24_f25.cpp` | micro | untimed call holds the mutex 600 ms; the timed one waits 630 ms |
+| 26 | `http/f26_f08_f14_hostile_daemon.py` | http | plaintext daemon stub serving attacker-chosen values |
+| 27 | `f_misc.cpp` | micro | `size()-1 = 18446744073709551615` |
+| 28 | `f23_f28_f30_f32.cpp` | micro | ignored return; indeterminate bytes used as a lookup key |
+| 29 | `f_misc.cpp` | micro | `additional_derivations[2]` on a 2-element vector |
+| 30 | `f23_f28_f30_f32.cpp` | micro | `has_error` set, empty block used, age 55.5 years |
+| 31 | `f_misc.cpp` | micro | `blk_no-1 = 18446744073709551615` |
+| 32 | `f23_f28_f30_f32.cpp` | micro | hex branch reaches commit with the check skipped |
+
+Findings 6, 19, 22, 23, 27, 28 and 32 have working mechanism PoCs but **no reachable
+trigger** in the shipped code — the PoC proves the defect exists, the audit's
+reachability analysis explains why it cannot currently be driven. Finding 3 is folded
+into 21.
 
 ## Safety
 
