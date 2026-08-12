@@ -48,12 +48,19 @@ were.
 | [32](#32) | `enable_pusher` not re-checked on raw-hex push path | Low — latent |
 | ~~3~~ | *Superseded by 21* | — |
 
-**Seven findings are critical.** All are remotely reachable by an unauthenticated
-client. Six of them (21, 4, 5, 2, plus 17 and the latent 6/22) live in the two
-handlers that deserialise attacker-supplied wallet structures —
-`POST /checkandpush` and `POST /checkrawoutputkeys`. That is the concentration
-that matters: essentially every attacker-controlled field reaching an index or a
-container operation in those two handlers is unvalidated.
+**Seven findings are critical**, but they are not equally reachable — see
+[Exploitability triage](#triage) for a per-finding end-to-end verdict and the
+concrete request that reaches each one. In short: **1, 4, 5, 7, 24 and 17 are
+reachable in the deployment the project's own README recommends**; **2 and 21
+additionally require `--enable-output-key-checker`**, which no documented
+invocation sets; and **8 is not reachable by a web client at all** — it requires
+control of the daemon connection.
+
+Most of the critical set lives in the two handlers that deserialise
+attacker-supplied wallet structures — `POST /checkandpush` and
+`POST /checkrawoutputkeys`. That is the concentration that matters: essentially
+every attacker-controlled field reaching an index or a container operation in
+those two handlers is unvalidated.
 
 ## Threat model
 
@@ -179,10 +186,19 @@ from the attacker's blob, and `operator[]` performs no bounds check, so the atta
 picks an arbitrary 64-bit offset from the vector's base pointer. `outputs` may also
 be empty, in which case even index 0 dereferences a null data pointer.
 
-**Impact:** remote OOB heap read at a chosen offset. The value read becomes a DB
-output index whose fate is reflected in the response (`"Output with amount X and
-index Y does not exist!"`), giving an oracle that makes this a practical
-memory-disclosure primitive. Wild offsets crash the process.
+**Impact:** remote OOB heap read at a chosen offset, and the read value is
+**printed verbatim in the response body**, not merely inferred. On the
+`OUTPUT_DNE` path the handler does
+`return string(fmt::format("Output with amount {:d} and index {:d} does not
+exist!", tx_source_amount, index_of_real_output))` (`src/page.h:2932-2940`), which
+becomes the HTTP response at `main.cpp:555`. `index_of_real_output` *is* the
+out-of-bounds value. `output_entry` is `pair<uint64_t, rct::ctkey>` (72 bytes), so
+one request discloses the 8 bytes at `outputs.data() + 72 * real_output` for any
+chosen `real_output` — a direct 64-bit read primitive at 72-byte granularity, not
+an oracle. Wild offsets crash the process.
+
+This is corrected from the original write-up, which described it as an oracle; the
+disclosure channel is direct.
 
 **Fix:** reject when `tx_source.real_output >= tx_source.outputs.size()`. **Reject —
 do not clamp or skip.** Clamping would un-mask findings 6 and 22, which are
@@ -798,6 +814,142 @@ live. They must be fixed together.
 
 ---
 
+<a name="triage"></a>
+# Exploitability triage
+
+Each finding traced from its HTTP entry point through every guard to the vulnerable
+operation. **These are static traces, not executed exploits:** the monero libraries
+this project links against are not present in the review environment, so nothing here
+was compiled or run. Where a request shape is given it is derived from the code path,
+and should be confirmed against a real build before being treated as a working PoC.
+
+## Deployment profiles
+
+Reachability depends entirely on flags, and the README documents which ones to set —
+so "default" here means *what the project tells operators to run*, not what the
+binary does with no arguments.
+
+* **Profile A — docker-compose** (`README.md:215`):
+  `--daemon-url=monerod:18089 --enable-json-api --enable-autorefresh-option
+  --enable-emission-monitor --enable-pusher`, with a local monerod in the same
+  compose network.
+* **Profile B — recommended `docker run`** (`README.md:312`, `315`): the same flags,
+  but `--daemon-url=node.sethforprivacy.com:18089` — a **third-party public node
+  reached over plaintext HTTP**.
+* **Profile C — the author's own aliases** (`README.md:302`, `305`):
+  `--enable-pusher --enable-emission-monitor`.
+
+No documented invocation sets `--enable-key-image-checker`,
+`--enable-output-key-checker`, `--enable-mixin-details`, `--enable-mixin-guess` or
+`--enable-as-hex`.
+
+Profile B matters for more than convenience: it makes "the daemon is untrusted" a
+*documented configuration* rather than a hypothetical. Findings 8, 14 and 26 assume an
+attacker who controls daemon responses; under Profile B that is whoever runs the
+public node, or anyone on the network path, because finding 26 means the connection
+has no TLS.
+
+## Verdicts
+
+| # | Entry point | Gates | Verdict |
+|---|---|---|---|
+| 1 | `GET /search` | none | **Proven — no flags** |
+| 1 | `GET /api/transactions` | `--enable-json-api` (A/B) | **Proven — Profile A/B** |
+| 4 | `POST /checkandpush` | `--enable-pusher` (A/B/C) + valid boost archive | **Proven — Profile A/B/C** |
+| 5 | `POST /checkandpush` | as 4 | **Proven — Profile A/B/C** |
+| 24 | `POST /checkandpush` | as 4 | **Proven — Profile A/B/C** |
+| 17 | `POST /checkandpush` | `--enable-pusher` | **Proven — Profile A/B/C** |
+| 16 | `POST /checkandpush` | `--enable-pusher` | **Proven — Profile A/B/C** |
+| 7 (URL leak) | `POST /myoutputs` | none | **Proven — no flags** |
+| 7 (rendered key) | `POST /checkrawoutputkeys`, `/checkrawkeyimgs` | `--enable-output-key-checker` / `--enable-key-image-checker` | **Proven, but no documented profile enables these** |
+| 7 (stderr log) | `POST /myoutputs` | none | **Proven — no flags** |
+| 2 | `POST /checkrawoutputkeys` | `--enable-output-key-checker` + signed blob | **Proven, undocumented flag** |
+| 21 | `POST /checkrawoutputkeys` | as 2 + valid boost archive | **Proven, undocumented flag** |
+| 10 | `GET /tx/<hash>` | none | **Plausible — needs a DB size mismatch, not attacker-forced** |
+| 29 | `POST /myoutputs` | `--enable-mixin-guess` | **Proven, undocumented flag** |
+| 8 | daemon RPC | daemon control or MITM | **Refuted for web clients; proven for Profile B attacker** |
+| 14 | daemon RPC | daemon control or MITM | **Plausible for Profile B attacker** |
+| 12, 31 | `GET /api/emission` | `--enable-emission-monitor` (A/B/C) | **Proven (12 needs a near-empty chain)** |
+| 13 | startup | corrupt `emission_amount.txt` | **Proven — local file condition** |
+| 15 | `GET /` | empty LMDB | **Proven — edge configuration only** |
+| 9, 18, 25, 26, 20 | always active | none | **Proven — configuration/structural** |
+| 11 | `POST /checkandpush` | `--enable-pusher` | **Proven as UB; benign on glibc** |
+| 30 | `GET /tx/<hash>` | none | **Proven — requires a failing lookup (see finding 9)** |
+| 6 | — | — | **Refuted — no reachable trigger** |
+| 22 | — | — | **Refuted — no reachable trigger** |
+| 19, 23, 27, 28 | — | dead code | **Refuted — no callers** |
+| 32 | — | route not registered when flag off | **Refuted — unreachable** |
+
+## Chains proven end to end
+
+**Finding 1 — `GET /search`.** `qs_k2v` returns `nullptr` when the key is absent
+(`ext/crow_all.h:373`, verified). With no query string `key_value_pairs_` is empty, the
+lookup loop never runs, and `string(nullptr)` is constructed at `main.cpp:635` before
+`remove_bad_chars` is ever entered. No flags, no body, one request.
+
+**Finding 1 — API variant.** The guard and the read disagree, and I verified the exact
+mechanism: `qs_k2v` compares only `strlen(key)` bytes
+(`qs_strncmp(key, qs_kv[i], key_len)`), so lookups are prefix matches over the stored
+`"k=v"` strings. `GET /api/transactions?foo=page=1` stores one pair `"foo=page=1"`;
+`qs_k2v("page", …)` compares `"page"` against `"foo="` → no match → `nullptr`, while
+`regex_search(req.raw_url, regex{"page=\\d+"})` matches the substring inside the
+*value*. Guard passes, read returns null, process dies.
+
+**Finding 4 — `POST /checkandpush`.** Body `rawtxdata=<base64>&action=check`. The blob
+must survive `remove_bad_chars` (base64's alphabet is exactly `[A-Za-z0-9+/=]`, so it
+does) and begin with `UNSIGNED_TX_PREFIX` = `"Monero unsigned tx set\003"`
+(`src/monero_headers.h:12`) after decoding. The remainder is a
+`portable_binary_iarchive` of `tools::wallet2::unsigned_tx_set`. Set one
+`tx_construction_data` with one `tx_source_entry` whose `outputs` is non-empty and
+whose `real_output` is the desired offset. `src/page.h:2917` then reads out of bounds
+and `src/page.h:2932` prints the value. **There is no signature or encryption on this
+path** — unlike `/checkrawoutputkeys` — so the only real work is producing a
+version-compatible archive, which is obtainable by exporting an unsigned tx from a
+matching monero wallet and patching the `real_output` field.
+
+**Finding 5 — same request, different field.** Keep `real_output` valid (index 0
+pointing at a real global output index, so the DB lookup at `src/page.h:2926`
+succeeds and `mcore->get_tx` finds the source tx) and set `real_output_in_tx_index`
+to the desired offset. `src/page.h:2958` then reads out of bounds and the value is
+rendered as `real_out_pub_key`. This chain is **independent of finding 4** — fixing 4
+alone does not close it.
+
+**Findings 2 and 21 — `POST /checkrawoutputkeys`.** Body
+`rawoutputkeysdata=<base64>&viewkey=<64 hex>`. Two gates beyond the flag: the decoded
+blob must start with `OUTPUT_EXPORT_FILE_MAGIC` = `"Monero output export\003"`
+(`src/monero_headers.h:15`), and `xmreg::decrypt(..., prv_view_key, true)` must
+authenticate it — `crypto::check_signature(hash, pkey, signature)` where `pkey` is
+derived from the submitted view key (`src/tools.cpp:1080-1092`). Both are satisfied by
+the attacker, who chooses the view key and therefore can sign: the payload is
+`magic || 8-byte IV || ciphertext || 64-byte signature`. For finding 2 a 1-byte
+plaintext suffices (73 bytes total clears the `< 72` check), and
+`src/page.h:3891` then reads 64 bytes from it. For finding 21 the plaintext must be
+≥64 bytes and carry a valid archive of `std::vector<transfer_details>` whose
+`m_txid` names a real on-chain non-coinbase RingCT tx.
+
+## What the triage changed
+
+* **Finding 4's impact is stronger than reported.** It was described as an oracle. It
+  is a direct read: the out-of-bounds 64-bit value is formatted into the response body
+  verbatim (`src/page.h:2932-2940` → `main.cpp:555`). Corrected in its section.
+* **The summary's blanket reachability claim was wrong.** It said all seven criticals
+  are "remotely reachable by an unauthenticated client". Finding 8 is not reachable by
+  a web client at all — it needs control of the daemon connection — and findings 2, 21
+  and 29 require flags that no documented invocation sets. Corrected.
+* **Findings 2 and 21 are gated behind an undocumented flag.** This does not reduce
+  their severity where the flag *is* set — 21 remains the only attacker-directed write
+  in the report — but it does change deployment priority. An operator following the
+  README is not exposed to them; an operator who enabled the output-key checker is.
+* **Profile B raises findings 8, 14 and 26.** The README recommends pointing the
+  explorer at a third-party public node over plaintext HTTP, so the "untrusted daemon"
+  attacker those findings assume is a documented configuration, not a contrived one.
+* **Fix order is unchanged but its rationale shifts.** 21 still leads on severity, but
+  **4 and 5 lead on exposure** — they are reachable in every documented profile, need
+  no crypto gate, and 4 discloses memory directly. If patching is sequenced by risk to
+  actual deployments, 4 and 5 come first.
+
+---
+
 # File coverage
 
 Every file read in full, twice.
@@ -833,10 +985,14 @@ better.
 
 # Recommended fix order
 
-1. **21** — the only attacker-directed write; fix both the bounds checks *and* the
-   `unsigned int` parameter width.
-2. **4** — by **rejecting** the request, not clamping. Fix **6** and **22** in the
-   same change, since 4 is what currently masks them.
+1. **4** and **5** — highest *exposure*: reachable in every documented deployment
+   profile, no crypto gate, and 4 discloses 64 bits of heap memory per request
+   directly in the response body. Fix 4 by **rejecting** the request, not clamping,
+   and fix **6** and **22** in the same change since 4 is what currently masks them.
+   Note 5 is an independent chain — fixing 4 does not close it.
+2. **21** — highest *severity*: the only attacker-directed write. Gated behind
+   `--enable-output-key-checker`, so lower deployment priority than 4/5, but fix both
+   the bounds checks *and* the `unsigned int` parameter width.
 3. **5**, **2** — the two OOB reads that reach the response body.
 4. **1** — one line per handler, removes a trivial remote kill.
 5. **7** — no code-path risk, but the highest-value secret in the system.
