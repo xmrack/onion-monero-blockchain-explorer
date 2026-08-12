@@ -936,3 +936,149 @@ argument, so the daemon RPC password is visible in `ps` output and
 `/proc/<pid>/cmdline` to every local user. Combined with finding 26 (no TLS),
 these credentials are not well protected at either end. Conventional for this
 class of tool, but worth an environment-variable or file-based alternative.
+
+---
+
+# Recheck pass
+
+A second read of every file, with the specific aim of falsifying the earlier
+findings as well as looking for new ones. It produced two new defects and one
+retraction — the retraction matters more than the additions.
+
+## 29. Wrong loop counter indexes the mixin derivation vector — HIGH
+
+**Where:** `src/page.h:2591`, in the `--enable-mixin-guess` block of
+`show_my_outputs()` (`/myoutputs`, `/prove`).
+
+```cpp
+// 2569 — correct
+derive_public_key(additional_derivations[output_idx_in_tx], output_idx_in_tx, ...);
+...
+// 2591 — wrong variable, 22 lines later, same vector
+auto derivation_to_use = with_additional
+        ? additional_derivations[output_idx] : derivation;
+```
+
+Two different index variables are used against the same vector:
+
+* `output_idx_in_tx` (declared `src/page.h:2539`) is the output index **within the
+  mixin transaction** — correct.
+* `output_idx` (declared `src/page.h:2213`) is the counter of the loop over the
+  **target transaction's own outputs**, which finished before the
+  `if (enable_mixin_guess)` block opens at `src/page.h:2325`. It therefore holds
+  a stale, terminal value: `txd.output_pub_keys.size()`.
+
+The `additional_derivations` referenced at 2591 is not the one `output_idx`
+belongs to. An inner declaration at `src/page.h:2481-2482` **shadows** the outer
+vector and is sized by `mixin_additional_tx_pub_keys.size()` — the *mixin*
+transaction's additional pubkey count. The shadowing is what hides the bug; the
+sibling sites at `src/page.h:2271` and `6024` use `additional_derivations[output_idx]`
+correctly, because there the vector in scope really is the outer one.
+
+Reaching line 2591 requires `with_additional == true`, which requires
+`mixin_additional_tx_pub_keys.size() == output_pub_keys.size()`. So the vector's
+size equals the mixin tx's parsed output count while the index equals the target
+tx's output count. For the overwhelmingly common case — a 2-output transaction
+whose ring member is also a 2-output transaction — the index is exactly `2` into
+a 2-element vector: **out of bounds by one element**.
+
+**Impact:** a 32-byte heap out-of-bounds read of a `key_derivation`, which is then
+fed to `decode_ringct` to decode an output amount that is rendered in the
+response. It is simultaneously a correctness bug: even when the read happens to
+land in bounds, it uses an unrelated ring member's derivation, so the decoded
+amount and the "is this output mine" determination are wrong.
+
+Gated behind `--enable-mixin-guess` (non-default), and the trigger is a user's
+own submitted view key rather than a third party's input, which is why this is
+High rather than Critical.
+
+**Fix:** use `output_idx_in_tx` at line 2591, and rename the shadowing inner
+vector so the two cannot be confused again.
+
+## 30. Failed block/tx lookups set an error flag and then keep going — MEDIUM
+
+**Where:** `src/page.h:6432-6458` in `construct_tx_context()`.
+
+```cpp
+if (!mcore->get_block_by_height(output_data.height, blk))
+{
+    context["has_error"] = true;
+    context["error_msg"] = fmt::format("- cant get block of height: {}", ...);
+}   // <-- no return
+
+pair<string, string> mixin_age = get_age(server_timestamp, blk.timestamp, ...);
+...
+if (!mcore->get_tx(tx_out_idx.first, mixin_tx))
+{
+    context["has_error"] = true;
+    ...
+}   // <-- no return
+
+tx_details mixin_txd = get_tx_details(mixin_tx, true);
+```
+
+Both handlers record the error and then fall through to use the object that was
+never populated. `blk` is a default-constructed block, so `blk.timestamp` is 0 and
+`get_age` reports an age of ~56 years; `mixin_tx` is a default-constructed
+transaction fed to `get_tx_details`. Every other failure path in this same
+function does `return context;` — these two are the exceptions.
+
+Not memory-unsafe (both objects are validly constructed, just empty), so this is
+a correctness/robustness defect rather than an exploitable one: the page renders
+fabricated ring-member metadata instead of failing. Under finding 9's
+`MDB_NOLOCK` reader these lookups are exactly the ones expected to fail
+intermittently.
+
+**Fix:** `return context;` in both handlers, matching the rest of the function.
+
+## Correction: finding 22 is not reachable — downgrade to LOW (latent)
+
+I claimed two trigger paths for the `*min_element()` null dereference. Rechecking
+both, **neither holds.** The underlying defect is real; my reachability analysis
+was wrong.
+
+**Path 1 was simply the wrong function.** I cited the `break`-on-`OUTPUT_DNE` at
+`src/page.h:2437` as appending an empty group. That code is inside
+`show_my_outputs()`, and `show_my_outputs()` never calls
+`construct_mstch_mixin_timescales` — the only two call sites are
+`src/page.h:3054` and `src/page.h:6507`. The structurally analogous loop in
+`construct_tx_context()` handles `OUTPUT_DNE` with `return context;`
+(`src/page.h:6425`), not `break`, so it cannot append an empty group either. My
+claim that this was reachable "on the ordinary transaction page, no pusher
+required" was wrong, and that was the most alarming part of the finding.
+
+**Path 2 is masked by finding 4.** In `show_checkrawtx`, the only way to produce
+an empty group is a `tx_source` whose `outputs` vector is empty. But
+`src/page.h:2917` dereferences `tx_source.outputs[tx_source.real_output]` earlier
+in the *same* loop iteration — on an empty vector that is a null dereference, so
+the process dies at finding 4 before the group is ever pushed. And a *non-empty*
+`outputs` cannot yield an empty group: every failure inside the collection loop
+(`src/page.h:2969-3040`) is a `return`, never a skip, so the timestamp vector is
+either fully populated or the handler has already returned.
+
+**Revised status:** `construct_mstch_mixin_timescales` genuinely dereferences
+`min_element`/`max_element` without checking for an empty range, and it should be
+fixed. But I cannot demonstrate a reachable trigger, so it is LOW/latent, not
+Critical. It becomes reachable if finding 4 is fixed by clamping or skipping the
+bad index rather than rejecting the request — so fix finding 4 by **rejecting**,
+and fix this one at the same time.
+
+The note I attached to finding 6 also depended on path 2 and is withdrawn with
+it: finding 6's own reachability argument (`*(r.begin())` is dereferenced
+unguarded on every "not found" result from `boost::find_nth`) does not depend on
+the empty-`outputs` route and still stands.
+
+## Additional instance of finding 10
+
+`src/page.h:1626`, in `show_ringmemberstx_hex()` (`/ringmemberstxhex/<hash>`,
+`--enable-as-hex`), throws `std::runtime_error` directly from a route handler
+when a ring member's transaction cannot be fetched. Unlike the `.at()` cases this
+is a deliberate throw, but the consequence is identical: it unwinds into the asio
+worker loop, the response is never completed, and the connection hangs.
+
+## Revised severity summary
+
+Net effect of the recheck: one High added (29), one Medium added (30), and
+finding 22 drops from Critical to Low. **Nine findings remain genuinely
+critical: 1, 2, 4, 5, 6, 7, 8, 21** — with 21 (the truncation-split bounds check)
+the most serious, and 3 folded into it.
