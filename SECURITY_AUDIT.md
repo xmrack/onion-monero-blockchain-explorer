@@ -1,15 +1,308 @@
-# Security audit — three critical vulnerabilities
+# Security audit — onion-monero-blockchain-explorer
 
-All three are reachable by an unauthenticated remote client against a default
-build of the explorer.
+Full review of every source file in the tree, plus a second verification pass over
+each finding. Findings are ordered by severity and numbered stably: the numbers are
+the ones used in the commit history, so they are not renumbered here even though the
+order has changed.
+
+Where a finding was revised or retracted during verification, the current status is
+what appears in its section. A summary of every change is in
+[Corrections](#corrections) — that section exists because two of the original
+claims did not survive checking, and the reasons are more useful than the claims
+were.
+
+## Summary
+
+| # | Finding | Severity |
+|---|---|---|
+| [21](#21) | Integer truncation splits a bounds check from its write target | **Critical** |
+| [4](#4) | Attacker-controlled 64-bit index into `tx_source.outputs` | **Critical** |
+| [5](#5) | Attacker-controlled index into `output_pub_keys` | **Critical** |
+| [2](#2) | Missing header-length check → OOB read echoed in response | **Critical** |
+| [7](#7) | Private view keys rendered, logged, and placed in URLs | **Critical** |
+| [8](#8) | Unterminated `char[10]` → OOB read on the front page | **Critical** |
+| [1](#1) | Null dereference on missing query parameter | **Critical** |
+| [9](#9) | LMDB opened `MDB_NOLOCK` against a live writer | High |
+| [10](#10) | Exceptions escape Crow route handlers | High |
+| [24](#24) | Two attacker-controlled halves of one blob indexed against each other | High |
+| [29](#29) | Wrong loop counter indexes a shadowed derivation vector | High |
+| [11](#11) | `isprint(char)` undefined behaviour | Medium |
+| [12](#12) | Emission-monitor underflow plus ignored error returns | Medium |
+| [13](#13) | Wrong catch clause on emission file load | Medium |
+| [14](#14) | Unchecked `gmtime_r` result | Medium |
+| [15](#15) | Division by zero on an empty chain | Medium |
+| [16](#16) | No CSRF protection on the pusher endpoint | Medium |
+| [17](#17) | No resource limits on the deserialisation endpoints | Medium |
+| [18](#18) | Build produces no hardening and no optimisation | Medium |
+| [25](#25) | RPC calls can hang while holding the shared daemon mutex | Medium |
+| [26](#26) | Daemon RPC transport security hardcoded off | Medium |
+| [30](#30) | Failed lookups set an error flag and continue anyway | Medium |
+| [6](#6) | Unguarded `*(r.begin())` write in timescale marking | Low — latent |
+| [22](#22) | `*min_element()` on a possibly-empty range | Low — latent |
+| [19](#19) | Unlocked shared HTTP client | Low — dead code |
+| [23](#23) | `return 0;` from a `std::string` function | Low — dead code |
+| [27](#27) | `.at(0)` and unsigned underflow in JSON helpers | Low — dead code |
+| [28](#28) | Ignored `parse_hash256` result | Low — dead code |
+| [20](#20) | Footer template re-read from disk per request | Low |
+| ~~3~~ | *Superseded by 21* | — |
+
+**Seven findings are critical.** All are remotely reachable by an unauthenticated
+client. Six of them (21, 4, 5, 2, plus 17 and the latent 6/22) live in the two
+handlers that deserialise attacker-supplied wallet structures —
+`POST /checkandpush` and `POST /checkrawoutputkeys`. That is the concentration
+that matters: essentially every attacker-controlled field reaching an index or a
+container operation in those two handlers is unvalidated.
+
+## Threat model
+
+Three input sources are treated as untrusted:
+
+1. **HTTP request data** — paths, query parameters and POST bodies from any
+   unauthenticated client.
+2. **Deserialised wallet blobs** — `POST /checkandpush` and
+   `POST /checkrawoutputkeys` feed base64 input straight into
+   `boost::archive::portable_binary_iarchive` and reconstruct
+   `tools::wallet2::unsigned_tx_set`, `pending_tx` and `transfer_details`. Every
+   field, including values used as array indices, is attacker-chosen. The attacker
+   also supplies the view key that authenticates their own blob, so no victim is
+   required.
+3. **The monero daemon** — `--daemon-url` accepts a remote host and finding 26
+   shows the connection is plaintext, so daemon-supplied values are controllable
+   by the node operator or anyone on the network path.
+
+One structural fact shapes several severities: Crow does not wrap
+`handler_->handle()` in a try/catch (`ext/crow_all.h:9647`); the asio worker loop
+catches `std::exception` and logs `"Worker Crash"` (`ext/crow_all.h:11045`). So a
+thrown exception hangs one connection, while a segfault kills the process. Findings
+that throw are therefore High at most; findings that dereference bad memory are
+Critical.
 
 ---
 
-## 1. Null-pointer dereference in query-parameter handling — remote DoS
+# Critical
 
-**Where:** `main.cpp:631-638` (`/search`), and the same pattern in every JSON API
-handler that guards on a regex over the raw URL: `main.cpp:707`, `722`, `756`,
-`777`, `811`.
+<a name="21"></a>
+## 21. Integer truncation splits a bounds check from its write target
+
+**Where:** `src/page.h:3973-3985` (`POST /checkrawoutputkeys`), signature at
+`src/tools.h:246-251`.
+
+```cpp
+bool decode_ringct(const rct::rctSig & rv,
+                   const crypto::public_key pub,
+                   const crypto::secret_key &sec,
+                   unsigned int i,          // <-- 32-bit
+                   rct::key & mask,         // <-- non-const: an OUT parameter
+                   uint64_t & amount);
+```
+
+```cpp
+bool r = decode_ringct(tx.rct_signatures, tx_pub_key, prv_view_key,
+                       td.m_internal_output_index,                                 // (A)
+                       tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask, // (B)
+                       xmr_amount);
+```
+
+`td.m_internal_output_index` is a `uint64_t` deserialised from the attacker's blob,
+used twice at two different widths. **(A)** is truncated to its low 32 bits by the
+`unsigned int i` parameter. **(B)** indexes `std::vector<rct::ecdhTuple>` with the
+full 64 bits, and the resulting reference is the function's output parameter.
+
+Monero's `rct::decodeRctSimple` opens with
+`CHECK_AND_ASSERT_THROW_MES(i < rv.ecdhInfo.size(), "Bad index")` and later performs
+`mask = ecdh_info.mask;`. **The value that is validated and the value that selects
+the memory being written are different numbers.**
+
+### Two primitives from one field
+
+**Out-of-bounds write.** Set `m_internal_output_index = 0x0000_0001_0000_0000`. The
+truncated `i` is `0`, which passes the check, and 32 bytes are then written to
+`ecdhInfo.data() + 0x1_0000_0000 * sizeof(ecdhTuple)`.
+
+**Arbitrary-offset read with a response-visible oracle.** Make the truncated `i`
+*invalid* instead (low 32 bits ≥ `ecdhInfo.size()`). Monero throws, `catch (...)` in
+`decode_ringct` (`src/tools.cpp:974`) swallows it and returns `false` — so the
+`r = r || decode_ringct(...)` short-circuit **does** evaluate the second call. That
+one reads `additional_tx_pub_keys[td.m_internal_output_index]` by value with no
+truncation and no check anywhere: a 32-byte read at `base + 32 * k` for any chosen
+`k`. The bytes become `pub`, are fed to `generate_key_derivation`, and whether that
+succeeds — plus any decoded amount — is reflected in the response.
+
+**Impact:** remote, unauthenticated, attacker-directed memory corruption, plus an
+arbitrary-offset read oracle over an address space that holds other users'
+submitted view keys. A segfault is not an exception, so the Crow worker `catch`
+does not contain it: this one kills the process.
+
+**Scope of the write, honestly:** the displacement is quantised to 256 GiB steps, so
+it cannot practically be aimed at a chosen heap object on 64-bit — in nearly all
+cases it lands unmapped and the process dies. The dependable outcome is a
+guaranteed remote crash; the *read* primitive is the precisely controllable one.
+No demonstrated path to code execution is claimed. It ranks first because it is the
+only finding that writes to attacker-chosen memory and because it defeats an
+upstream bounds check placed there specifically to prevent this.
+
+**Fix:**
+
+```cpp
+if (td.m_internal_output_index >= tx.rct_signatures.ecdhInfo.size())
+    { /* error out */ }
+if (td.m_internal_output_index >= additional_tx_pub_keys.size())
+    { /* skip the additional-key attempt */ }
+```
+
+and widen `unsigned int i` to `uint64_t` at `src/tools.h:250` and
+`src/tools.cpp:917`/`938`, so no call site can validate a different value than it
+dereferences. The missing check is what makes it reachable; **the width mismatch is
+the root cause** and leaving it in place lets any future call site reintroduce this.
+
+**Verification note:** the truncation and the full-width indexing of the
+out-parameter are verified directly in this repository. The
+`CHECK_AND_ASSERT_THROW_MES` guard and the `mask = ecdh_info.mask` write are from
+monero's `src/ringct/rctSigs.cpp`, which is not vendored in this checkout — confirm
+against the monero tree the explorer is built against (`v0.18.4.0` per the
+Dockerfile) before filing upstream.
+
+<a name="4"></a>
+## 4. Attacker-controlled 64-bit index into `tx_source.outputs`
+
+**Where:** `src/page.h:2917` (unsigned-tx path), `src/page.h:3301` (signed-tx path).
+
+```cpp
+uint64_t index_of_real_output = tx_source.outputs[tx_source.real_output].first;
+uint64_t index_of_real_output = std::get<0>(tx_source.outputs[tx_source.real_output]);
+```
+
+`outputs` is a `std::vector<output_entry>`; `real_output` is a `size_t`. Both come
+from the attacker's blob, and `operator[]` performs no bounds check, so the attacker
+picks an arbitrary 64-bit offset from the vector's base pointer. `outputs` may also
+be empty, in which case even index 0 dereferences a null data pointer.
+
+**Impact:** remote OOB heap read at a chosen offset. The value read becomes a DB
+output index whose fate is reflected in the response (`"Output with amount X and
+index Y does not exist!"`), giving an oracle that makes this a practical
+memory-disclosure primitive. Wild offsets crash the process.
+
+**Fix:** reject when `tx_source.real_output >= tx_source.outputs.size()`. **Reject —
+do not clamp or skip.** Clamping would un-mask findings 6 and 22, which are
+currently unreachable precisely because this crash happens first.
+
+<a name="5"></a>
+## 5. Attacker-controlled index into `output_pub_keys`
+
+**Where:** `src/page.h:2958`, `src/page.h:3334`.
+
+```cpp
+public_key real_out_pub_key
+        = std::get<0>(real_txd.output_pub_keys[tx_source.real_output_in_tx_index]);
+```
+
+`real_output_in_tx_index` is attacker-supplied; `output_pub_keys` is sized by the
+*on-chain* transaction just looked up, so the index bears no relation to it.
+Unchecked `operator[]`.
+
+**Impact:** remote OOB heap read whose bytes are rendered back to the client as
+`real_out_pub_key` and used in the `is_real` comparison — direct memory disclosure
+into the response, no oracle needed.
+
+**Fix:** bounds-check against `real_txd.output_pub_keys.size()`.
+
+<a name="2"></a>
+## 2. Missing header-length check → OOB read echoed in the response
+
+**Where:** `src/page.h:3891-3896` in `show_checkcheckrawoutput()`
+(`POST /checkrawoutputkeys`).
+
+```cpp
+const size_t header_lenght = 2 * sizeof(crypto::public_key);   // 64
+
+// no size check here
+const account_public_address* xmr_address =
+        reinterpret_cast<const account_public_address*>(decoded_raw_data.data());
+
+address_parse_info address_info {*xmr_address, false, false, crypto::null_hash8};
+```
+
+The decrypted payload is dereferenced as a 64-byte `account_public_address` without
+verifying it is at least 64 bytes long. The sibling key-image handler performs
+exactly this check at `src/page.h:3746`; it was omitted here.
+
+The attacker supplies both the blob and the view key that authenticates it
+(`xmreg::decrypt(..., prv_view_key, true)`), so producing an authenticated plaintext
+of one byte is trivial. The 64 bytes read past the end of the buffer are rendered
+into the response as the Monero address via `print_address()`.
+
+**Impact:** remote heap OOB read; adjacent heap memory — which in this process
+includes other users' submitted view keys and decrypted data — is echoed back to the
+attacker.
+
+**Fix:** return the "bad data size" error when
+`decoded_raw_data.size() < header_lenght`, mirroring the key-image path.
+
+<a name="7"></a>
+## 7. Private view keys are disclosed in full
+
+Three separate leaks of the most sensitive input the service accepts:
+
+* **Rendered into the response.** `src/page.h:3768` (`/checkrawkeyimgs`) and
+  `src/page.h:3902` (`/checkrawoutputkeys`) put the complete private view key into
+  the mstch context, and both templates print it verbatim
+  (`templates/checkrawkeyimgs.html:18`, `templates/checkrawoutputkeys.html:16`:
+  `<h4>Viewkey: {{viewkey}}</h4>`). `/myoutputs` deliberately masks the key first
+  (`src/page.h:2117-2121`), so this is an inconsistency rather than a decision.
+* **Written to the log.** `src/page.h:1968` logs the submitted key on a parse
+  failure; `src/page.h:2172-2174` and `2185-2187` log
+  `pod_to_hex(unwrap(unwrap(prv_view_key)))` when key derivation fails. Users' keys
+  accumulate in stderr/journald.
+* **Placed in a URL.** `src/page.h:2110-2113` builds
+  `"/myoutputs" + '/' + tx_hash + '/' + address + '/' + viewkey` and
+  `templates/my_outputs.html:81` renders it as a clickable link, leaking the key via
+  `Referer`, browser history and access logs. That line also has an
+  operator-precedence bug: `?:` binds looser than `+`, so the concatenation applies
+  only to the `/myoutputs` branch and the prove page's shortcut collapses to the
+  bare string `"/prove"`.
+
+**Impact:** permanent compromise of a submitted view key, which grants its holder
+visibility of every incoming transaction of that wallet, forever.
+
+**Fix:** mask as `/myoutputs` does; never log secret material; make the shortcut a
+POST or an opaque token rather than a URL path.
+
+<a name="8"></a>
+## 8. Unterminated `char[10]` → OOB read published on the front page
+
+**Where:** `src/MempoolStatus.cpp:294-303`; buffers at `src/MempoolStatus.h:77-78`;
+consumed at `src/page.h:805-806` and `815`.
+
+```cpp
+char block_size_limit_str[10];
+...
+strncpy(local_copy.block_size_limit_str,
+        fmt::format("{:0.2f}", double(local_copy.block_size_limit)/2.0/1024.0).c_str(),
+        sizeof(local_copy.block_size_limit_str));
+...
+{"block_size_limit", string {current_network_info.block_size_limit_str}},
+```
+
+`strncpy` with `n == sizeof(dst)` writes no NUL terminator when the source is 10
+characters or longer. `string{char*}` then runs `strlen` off the end of the array,
+through `block_size_median_str`, `start_time`, `current_hf_version` and onwards
+until it finds a zero byte, and puts the result into the HTML of `/`.
+
+Trigger: a daemon-reported `block_size_limit >= 2,048,000,000` (or
+`block_size_median >= 1,024,000,000`) makes the formatted value reach 10 characters.
+Per the threat model the daemon is untrusted.
+
+**Impact:** OOB read of adjacent `network_info` memory published to every visitor of
+the front page.
+
+**Fix:** use `snprintf`, which always terminates; or size the buffers for the worst
+case; or move the strings out of the trivially-copyable struct.
+
+<a name="1"></a>
+## 1. Null dereference on a missing query parameter
+
+**Where:** `main.cpp:631-638` (`/search`), and every JSON API handler that guards on
+a regex over the raw URL: `main.cpp:707`, `722`, `756`, `777`, `811`.
 
 ```cpp
 CROW_ROUTE(app, "/search").methods("GET"_method)
@@ -21,291 +314,31 @@ CROW_ROUTE(app, "/search").methods("GET"_method)
 });
 ```
 
-`crow::query_string::get()` returns `char*` and yields `nullptr` when the
-parameter is absent (`ext/crow_all.h:542`). Constructing `std::string` from a
-null pointer is undefined behaviour; on libstdc++ it calls `strlen(nullptr)` and
-segfaults, taking down the whole single-process server.
+`crow::query_string::get()` returns `char*` and yields `nullptr` when the parameter
+is absent (`ext/crow_all.h:542`). Constructing `std::string` from a null pointer is
+undefined behaviour; on libstdc++ it calls `strlen(nullptr)` and segfaults.
 
-* Trigger: `GET /search` (no `value=` at all).
-* The API handlers are subtly worse: they test `regex_search(req.raw_url,
-  regex{"page=\\d+"})` but then read `url_params.get("page")`. The regex matches
-  anywhere in the raw URL, including inside *another* parameter's value, so
-  `GET /api/transactions?foo=page=1` passes the guard while `page` is not a real
-  parameter → `nullptr` → crash. Same for `limit`, `grace_blocks`, `txhash`,
-  `address`, `viewkey`, `startblock`, `endblock`, and the `lexical_cast` on
-  `txprove` / `mempool`.
+* Trigger: `GET /search` with no `value=` at all.
+* The API handlers are subtler: they test
+  `regex_search(req.raw_url, regex{"page=\\d+"})` but then read
+  `url_params.get("page")`. The regex matches anywhere in the raw URL, including
+  inside another parameter's *value*, so `GET /api/transactions?foo=page=1` passes
+  the guard while `page` is not a real parameter. Same for `limit`, `grace_blocks`,
+  `txhash`, `address`, `viewkey`, `startblock`, `endblock`, and the `lexical_cast`
+  on `txprove` / `mempool`.
 
-**Impact:** trivial unauthenticated full-service denial of service.
+**Impact:** trivial unauthenticated denial of service that kills the process. Listed
+last among the criticals only because it discloses nothing.
 
-**Fix:** check the pointer (or use `req.url_params.get("x") ? ... : ""`) instead
-of regex-matching the raw URL; never construct `std::string` from the raw result.
-
----
-
-## 2. Missing header-length check → heap out-of-bounds read and memory disclosure
-
-**Where:** `src/page.h:3891-3896` in `show_checkcheckrawoutput()`
-(`POST /checkrawoutputkeys`).
-
-```cpp
-const size_t header_lenght = 2 * sizeof(crypto::public_key);   // 64
-
-// no size check here
-const account_public_address* xmr_address =
-        reinterpret_cast<const account_public_address*>(
-                decoded_raw_data.data());
-
-address_parse_info address_info {*xmr_address, false, false, crypto::null_hash8};
-```
-
-The decrypted payload is dereferenced as a 64-byte `account_public_address`
-without verifying that it is at least 64 bytes long. The sibling key-image
-handler does perform exactly this check (`src/page.h:3746`, `if
-(decoded_raw_data.size() < header_lenght)`); it was omitted here.
-
-The attacker fully controls the payload: they supply both the base64 blob and the
-view key used to decrypt/authenticate it (`xmreg::decrypt(..., prv_view_key,
-true)`), so they can produce an authenticated plaintext of any length — e.g. one
-byte. The 64 bytes are then read past the end of the heap buffer and the result
-is **rendered back into the response** as the Monero address
-(`print_address(address_info, nettype)`).
-
-**Impact:** remote heap out-of-bounds read; adjacent heap memory (which in this
-process includes other users' submitted view keys and decrypted data) is echoed
-back to the attacker. Can also crash the process.
-
-**Fix:** return the "bad data size" error when
-`decoded_raw_data.size() < header_lenght`, mirroring the key-image path.
+**Fix:** check the pointer (`req.url_params.get("x") ? ... : ""`) instead of
+regex-matching the raw URL; never construct `std::string` from the raw result.
 
 ---
 
-## 3. Unvalidated attacker-controlled index into `ecdhInfo` / `additional_tx_pub_keys`
+# High
 
-**Where:** `src/page.h:3970-3985`, same handler (`POST /checkrawoutputkeys`).
-
-```cpp
-bool r = decode_ringct(tx.rct_signatures,
-                       tx_pub_key,
-                       prv_view_key,
-                       td.m_internal_output_index,
-                       tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask,
-                       xmr_amount);
-r = r || decode_ringct(tx.rct_signatures,
-                       additional_tx_pub_keys[td.m_internal_output_index],
-                       ...
-                       tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask,
-                       xmr_amount);
-```
-
-`td` is a `tools::wallet2::transfer_details` deserialised straight from the
-attacker's blob via `boost::archive::portable_binary_iarchive`
-(`src/page.h:3913-3921`). `m_internal_output_index` is therefore fully
-attacker-controlled and is used to index two `std::vector`s with `operator[]`
-(no bounds check):
-
-* `tx.rct_signatures.ecdhInfo[...]` — a vector whose size is determined by the
-  on-chain transaction `td.m_txid`, not by the attacker's index;
-* `additional_tx_pub_keys[...]` — commonly **empty** for ordinary transactions,
-  so index 0 is already out of bounds on the second call.
-
-Both reads occur outside the `try`/`catch` that wraps deserialisation, and
-`operator[]` throws nothing — it is straight undefined behaviour.
-
-**Impact:** remote out-of-bounds heap read with an attacker-chosen 64-bit offset,
-feeding into ring-CT decoding whose result is reflected in the response. Crash or
-information disclosure; with a chosen offset this is the most powerful of the
-three primitives.
-
-**Fix:** validate before use —
-`td.m_internal_output_index < tx.rct_signatures.ecdhInfo.size()` and, for the
-second call, `td.m_internal_output_index < additional_tx_pub_keys.size()` —
-and error out otherwise.
-
----
-
-### Lower-severity note
-
-`rpccalls::get_base_fee_estimate()` (`src/rpccalls.cpp:44-67`) is the only RPC
-method that uses the shared `m_http_client` **without** taking
-`m_daemon_rpc_mutex`. It is currently unreachable (its only caller,
-`page.h:6952`, is dead code), but wiring it into a handler would introduce a data
-race on the HTTP client across Crow worker threads. It also assigns
-`fee_estimate = res.fee` before checking the request succeeded.
-
----
-
-# Five further critical vulnerabilities
-
-Findings 4–6 all live in the tx-pusher/checker (`POST /checkandpush`, enabled with
-`--enable-pusher`). Its input is a base64 blob that is fed straight into
-`boost::archive::portable_binary_iarchive` and deserialised into wallet
-structures (`tools::wallet2::unsigned_tx_set` / `pending_tx`). Every field of
-those structures — including several values used as **array indices** — is
-therefore attacker-controlled, and none of them is validated.
-
-## 4. Attacker-controlled 64-bit index into `tx_source.outputs` — OOB read
-
-**Where:** `src/page.h:2917` (unsigned-tx path) and `src/page.h:3301` (signed-tx path).
-
-```cpp
-uint64_t index_of_real_output = tx_source.outputs[tx_source.real_output].first;
-// ...
-uint64_t index_of_real_output = std::get<0>(tx_source.outputs[tx_source.real_output]);
-```
-
-`tx_source.outputs` is a `std::vector<output_entry>` and `tx_source.real_output`
-is a `size_t`; both come out of the attacker's blob. `operator[]` performs no
-bounds check, so the attacker picks an arbitrary 64-bit offset from the vector's
-base pointer. `outputs` may also be **empty**, in which case even index 0 is out
-of bounds.
-
-**Impact:** remote out-of-bounds heap read at a fully chosen offset. The value read
-is then used as a DB output index and its fate is reflected in the response
-("Output with amount X and index Y does not exist!"), giving the attacker an
-oracle that turns this into a practical memory-disclosure primitive. Wild offsets
-crash the worker.
-
-**Fix:** reject the tx when `tx_source.real_output >= tx_source.outputs.size()`.
-
-## 5. Attacker-controlled index into `output_pub_keys` — OOB read
-
-**Where:** `src/page.h:2958` and `src/page.h:3334`.
-
-```cpp
-public_key real_out_pub_key
-        = std::get<0>(real_txd.output_pub_keys[tx_source.real_output_in_tx_index]);
-```
-
-`real_output_in_tx_index` is again attacker-supplied, while `output_pub_keys` is
-sized by the *on-chain* transaction that was just looked up — the attacker's index
-has no relationship to it whatsoever. Unchecked `operator[]` again.
-
-**Impact:** remote OOB heap read; the bytes read are rendered back to the client as
-`real_out_pub_key` / used in the `is_real` comparison — i.e. **direct memory
-disclosure into the HTTP response**, no oracle needed.
-
-**Fix:** bounds-check against `real_txd.output_pub_keys.size()`.
-
-## 6. `size_t` underflow → out-of-bounds write in `mark_real_mixins_on_timescales`
-
-**Where:** `src/page.h:6152-6161`.
-
-```cpp
-size_t no_points = std::count(timescale.begin(), timescale.end(), '*');
-size_t point_to_find = real_output_indices.at(idx);
-
-if (point_to_find >= no_points)
-    point_to_find = no_points - 1;          // no_points == 0  ->  SIZE_MAX
-
-boost::iterator_range<string::iterator> r
-        = boost::find_nth(timescale, "*", point_to_find);
-
-*(r.begin()) = 'R';                          // never checked for "not found"
-```
-
-If a `tx_source` carries an empty `outputs` vector the corresponding mixin group is
-empty, the rendered timescale contains zero `'*'`, and `no_points - 1` wraps to
-`SIZE_MAX`. `boost::find_nth` then returns an empty range whose `begin()` is
-`timescale.end()`, and the code writes `'R'` through it.
-
-**Impact:** attacker-triggered out-of-bounds write of a chosen-position byte past the
-end of a heap `std::string` buffer — memory corruption, not merely a read. Note the
-`*(r.begin())` dereference is unguarded on *every* path, so any "not found" result
-is a write through an end iterator.
-
-**Fix:** skip the marking when `no_points == 0`, and check `!r.empty()` before writing.
-
-*(For the record: the adjacent `real_output_indices.at(idx)` is safe — the two
-containers are filled once per source in the same loop, so their sizes match.)*
-
-## 7. Private view keys and tx secret keys are disclosed in full
-
-Three separate leaks of the most sensitive input the explorer accepts:
-
-* **Rendered into the response page.** `src/page.h:3768` (`/checkrawkeyimgs`) and
-  `src/page.h:3902` (`/checkrawoutputkeys`) put the *complete* private view key into
-  the mstch context, and both templates print it verbatim
-  (`templates/checkrawkeyimgs.html:18`, `templates/checkrawoutputkeys.html:16`:
-  `<h4>Viewkey: {{viewkey}}</h4>`). The `/myoutputs` page deliberately masks the key
-  before rendering (`src/page.h:2117-2121`), so this is an inconsistency, not a
-  deliberate choice. The key then lands in browser cache, history and any
-  intermediate proxy.
-* **Written to the server log.** `src/page.h:1968` logs the submitted key on a parse
-  failure (`cerr << "Cant parse the private key: " << viewkey_str`), and
-  `src/page.h:2172-2174` / `2185-2187` log
-  `pod_to_hex(unwrap(unwrap(prv_view_key)))` whenever key derivation fails. Users'
-  private view keys therefore accumulate in stderr/journald.
-* **Placed in a URL.** `src/page.h:2110-2113` builds
-  `"/myoutputs" + '/' + tx_hash + '/' + address + '/' + viewkey` and
-  `templates/my_outputs.html:81` renders it as a clickable "link to this page" —
-  so the key leaks through the `Referer` header, browser history and access logs.
-  That line also has an operator-precedence bug: `?:` binds looser than `+`, so the
-  concatenation applies only to the `/myoutputs` branch and the prove page's
-  shortcut collapses to the bare string `"/prove"`.
-
-**Impact:** permanent compromise of the submitted view key — which grants the holder
-the ability to see all incoming transactions of that wallet forever. This is the
-single highest-value secret the service handles.
-
-**Fix:** mask the key as `/myoutputs` does, never log secret material, and make the
-shortcut a POST or an opaque token rather than a URL path.
-
-## 8. Unterminated fixed-size `char[10]` buffers → OOB read echoed on the front page
-
-**Where:** `src/MempoolStatus.cpp:294-303`, buffers declared at
-`src/MempoolStatus.h:77-78`, consumed at `src/page.h:805-806` and `815`.
-
-```cpp
-char block_size_limit_str[10];
-char block_size_median_str[10];
-...
-strncpy(local_copy.block_size_limit_str,
-        fmt::format("{:0.2f}", double(local_copy.block_size_limit)/2.0/1024.0).c_str(),
-        sizeof(local_copy.block_size_limit_str));
-...
-{"block_size_limit", string {current_network_info.block_size_limit_str}},
-```
-
-`strncpy` with `n == sizeof(dst)` writes **no NUL terminator** when the source is
-10 characters or longer — the classic `strncpy` footgun. `string{char*}` then runs
-`strlen` off the end of the array, through `block_size_median_str`, `start_time`,
-`current_hf_version` and onwards until it happens to find a zero byte, and puts
-whatever it collected into the HTML of `/`.
-
-The trigger is a daemon-reported `block_size_limit >= 2,048,000,000` (or
-`block_size_median >= 1,024,000,000`), which makes the formatted value reach 10
-characters. The daemon is a trust boundary here — `--daemon-url` explicitly
-supports pointing at a remote node — so a hostile or compromised daemon controls
-this value directly.
-
-**Impact:** out-of-bounds read of adjacent `network_info` memory published to every
-visitor of the front page; a sufficiently long run of non-zero bytes walks past the
-struct entirely.
-
-**Fix:** use `snprintf` (which always terminates), size the buffers for the worst
-case, or store the strings outside the trivially-copyable struct.
-
----
-
-### Lower-severity note
-
-`POST /checkandpush` deserialises an unbounded attacker-supplied structure and then,
-for **every** entry in **every** `tx_source.outputs`, performs a blockchain DB output
-lookup plus a tx fetch plus a block fetch (`src/page.h:2965-3040`). Crow applies no
-HTTP body size limit, so a single modest request expands into an arbitrary number of
-random DB reads and allocations — unauthenticated CPU/IO/memory amplification.
-
----
-
-# Findings 9–20
-
-The eight above are the ones I would call unambiguously critical. Continuing the
-sweep through `MicroCore`, `CurrentBlockchainStatus`, `tools.cpp`, the remaining
-`page.h` request paths and the build/deployment config turned up twelve more
-distinct root causes. They are listed with honest severities — several are real
-but not critical, and I have said so rather than inflating them.
-
-## 9. LMDB opened with `MDB_NOLOCK` against a concurrently-written database — HIGH
+<a name="9"></a>
+## 9. LMDB opened with `MDB_NOLOCK` against a concurrently-written database
 
 **Where:** `src/MicroCore.cpp:56-57`.
 
@@ -314,641 +347,80 @@ db_flags |= MDB_RDONLY;
 db_flags |= MDB_NOLOCK;
 ```
 
-`MDB_NOLOCK` disables LMDB's reader lock table. The reader therefore never
-registers a read transaction, so `monerod` — writing to the same database at the
-same time — is free to reclaim and overwrite pages that this process is still
-reading through. The explorer then parses that memory as blocks and transactions.
+`MDB_NOLOCK` disables the reader lock table, so this process never registers a read
+transaction and `monerod` is free to reclaim and overwrite pages it is still reading
+through. The explorer then parses that memory as blocks and transactions.
 
-**Impact:** torn reads, structurally invalid blobs and wild lengths flowing into
-the deserialisation paths — sporadic corruption and crashes that look like random
-data errors. This is also a *force multiplier* for findings 2–6: the length and
-index values those paths trust can come from a page that changed underneath them.
+**Impact:** torn reads and structurally invalid blobs flowing into the
+deserialisation paths — sporadic corruption and crashes that look like random data
+errors. It is also a force multiplier for findings 2–5: the lengths and indices
+those paths trust can come from a page that changed underneath them. It makes
+finding 30's "failed lookup" branches, and finding 10's container-size mismatches,
+substantially more likely than they look.
 
-**Fix:** drop `MDB_NOLOCK` (keep `MDB_RDONLY`) so the reader participates in the
-lock table.
+**Fix:** drop `MDB_NOLOCK`, keep `MDB_RDONLY`.
 
-## 10. Unhandled exceptions escape Crow route handlers — HIGH
+<a name="10"></a>
+## 10. Unhandled exceptions escape Crow route handlers
 
 **Where:** `src/page.h:6587` (`out_amount_indices.at(output_idx)` in
-`construct_tx_context`) and `src/page.h:2417` (`mixin_outputs.at(count)`), among
-others. Both `.at()` calls sit *outside* any enclosing `try`.
+`construct_tx_context`), `src/page.h:2417` (`mixin_outputs.at(count)`), and
+`src/page.h:1626` (`show_ringmemberstx_hex` throws `std::runtime_error` outright).
+None is inside an enclosing `try`.
 
-`.at()` throws `std::out_of_range` whenever the DB returns fewer amount indices
-than the tx has outputs, or fewer mixin outputs than absolute offsets. Crow does
-not wrap `handler_->handle()` in a try/catch (`ext/crow_all.h:9647`); the
-exception unwinds into the asio worker loop, which catches it and logs
-`"Worker Crash: An uncaught exception occurred"` (`ext/crow_all.h:11045`).
+`.at()` throws `std::out_of_range` whenever the DB returns fewer amount indices than
+the tx has outputs, or fewer mixin outputs than absolute offsets. Crow does not wrap
+`handler_->handle()` (`ext/crow_all.h:9647`); the exception unwinds into the asio
+worker loop, which catches it and logs `"Worker Crash"` (`ext/crow_all.h:11045`).
 
-**Impact:** the request is abandoned mid-flight — `res.complete_request_handler_`
-is never invoked, so the response is never completed and the client's connection
-is left hanging until timeout. Repeated triggering leaks connections and worker
-capacity. Note this also *caps* the impact of several exception-throwing bugs
-elsewhere in this report: they hang a connection rather than killing the process.
-The null-pointer deref in finding 1 is not an exception and does still kill it.
+**Impact:** the request is abandoned mid-flight — `res.complete_request_handler_` is
+never invoked, so the response never completes and the client's connection hangs
+until timeout. Repeated triggering leaks connections and worker capacity. This also
+*caps* the impact of every throwing bug in this report at connection-hang rather
+than process-death.
 
-**Fix:** wrap route bodies in a try/catch that returns a 500, and bounds-check
-before `.at()`.
+**Fix:** wrap route bodies in a try/catch returning 500, and bounds-check before
+`.at()`.
 
-## 11. `isprint()` called with a plain `char` — MEDIUM
+<a name="24"></a>
+## 24. Two attacker-controlled halves of one blob indexed against each other
 
-**Where:** `src/tools.cpp:1222`, inside `make_printable()`.
-
-```cpp
-for (char c: in_s)
-    if (isprint(c))
-```
-
-`char` is signed on x86-64. The `is*` functions are only defined for values
-representable as `unsigned char` or `EOF`; passing a negative value is undefined
-behaviour and, in glibc, indexes the `__ctype_b` table at a negative offset.
-
-Every byte an attacker submits reaches this: `make_printable(decoded_raw_tx_data
-.substr(0, magiclen))` runs on the base64-decoded blob on every `/checkandpush`,
-`/checkrawkeyimgs` and `/checkrawoutputkeys` request (`src/page.h:2799`, `3711`,
-`3857`), and any byte ≥ 0x80 is negative.
-
-**Impact:** out-of-bounds table read on attacker-controlled input. Benign in
-practice on glibc (the table is deliberately padded for this case), which is why
-this is medium and not critical — but it is UB and other libcs are not padded.
-
-**Fix:** `isprint(static_cast<unsigned char>(c))`.
-
-## 12. Emission monitor: underflow plus ignored error returns — MEDIUM
-
-**Where:** `src/CurrentBlockchainStatus.cpp:112-114` and `136-141`
-(`--enable-emission-monitor`).
+**Where:** `src/page.h:3285` and `src/page.h:3369` (`POST /checkandpush`, signed-tx
+path).
 
 ```cpp
-end_block = end_block > current_blockchain_height
-            ? current_blockchain_height - blockchain_chunk_gap   // underflows
-            : end_block;
-...
-mcore->get_block_by_height(start_blk, blk);      // return value ignored
-core_storage->get_transactions(blk.tx_hashes, txs, missed_txs);   // ignored
-```
-
-When `current_blockchain_height < blockchain_chunk_gap` (3) the subtraction wraps
-to ~2^64 and `calculate_emission_in_blocks(blk_no, ~2^64)` becomes an effectively
-unbounded loop. Inside it, the failed `get_block_by_height` is not checked, so
-`blk` silently retains the *previous* iteration's contents and its coinbase is
-counted again — `emission_calculated.coinbase += coinbase_amount - tx_fee_amount`
-then accumulates garbage (and can itself wrap).
-
-**Impact:** a background thread spinning at 100% CPU indefinitely and publishing
-wrong emission figures via `/api/emission`. Requires a near-empty chain, so:
-medium.
-
-**Fix:** clamp instead of subtracting, and check both return values.
-
-## 13. Wrong exception type caught when loading the emission file — MEDIUM
-
-**Where:** `src/CurrentBlockchainStatus.cpp:218-224`.
-
-```cpp
-try {
-    emission_loaded.blk_no   = boost::lexical_cast<uint64_t>(strs.at(0));
-    ...  strs.at(3) ...
-} catch (boost::bad_lexical_cast &e) { ... return false; }
-```
-
-`strs.at(n)` throws `std::out_of_range`, which this handler does not catch, so a
-truncated or partially-written `emission_amount.txt` terminates the process at
-startup. The surrounding code explicitly advertises that it handles this case
-("Emission file cant be read, got corrupted or has incorrect format"), so the
-intent is clearly to recover — the wrong catch clause defeats it. A short write
-during a crash or a full disk is enough to produce the file.
-
-**Fix:** check `strs.size() >= 4` first, or catch `std::exception`.
-
-## 14. Unchecked `gmtime_r` result → `strftime` on an indeterminate `struct tm` — MEDIUM
-
-**Where:** `src/tools.cpp:171` and `1263`.
-
-```cpp
-std::tm tmp;
-gmtime_r(t, &tmp);                       // return value not checked
-len = std::strftime(str_buff, TIME_LENGTH, format, &tmp);
-```
-
-`gmtime_r` returns `NULL` and leaves the output struct untouched when the
-timestamp cannot be represented. `tmp` is an uninitialised automatic, so
-`strftime` then reads indeterminate `tm_mon` / `tm_wday` values and uses them to
-index glibc's month- and day-name arrays — an out-of-bounds read.
-
-Reachability is the limiting factor: block timestamps are consensus-bounded and
-mempool receive times come from the local LMDB pool, so this needs a value from
-the daemon RPC path (`--daemon-url` may point at a node you do not control).
-Hence medium.
-
-**Fix:** check the return value and emit a placeholder on failure.
-
-## 15. Integer division by zero on an empty blockchain — MEDIUM
-
-**Where:** `src/page.h:621` and `635`.
-
-```cpp
-uint64_t no_of_last_blocks = std::min(no_blocks_on_index + 1, height);
-...
-{"total_page_no", (height / no_of_last_blocks)},
-```
-
-With `height == 0` the divisor is zero — integer division by zero is `SIGFPE`, an
-immediate process kill, on the front page. Only reachable against a freshly
-initialised/empty database, which is why it is medium rather than critical.
-
-**Fix:** guard the divisor, as `json_transactions` already does
-(`limit > 0 ? height / limit : 0`, `src/page.h:5108`).
-
-## 16. No CSRF protection on the state-changing pusher endpoint — MEDIUM
-
-**Where:** `main.cpp:537-560`, `POST /checkandpush` with `action=push`.
-
-The endpoint accepts a plain form-encoded POST with no token, no `Origin`/
-`Referer` check and no `SameSite` protection, and `action=push` **relays the
-submitted transaction to the daemon** (`rpccalls::commit_tx`). Any third-party
-web page can therefore make a visiting browser broadcast an attacker-chosen tx
-blob through this explorer's node.
-
-**Impact:** the explorer's node (and, on an onion service, its network identity)
-is used to originate transactions attributable to it, on behalf of visitors who
-never consented. Not memory corruption, but a real abuse primitive.
-
-**Fix:** require a CSRF token, or at minimum validate `Origin`.
-
-## 17. No resource limits on the deserialisation endpoints — MEDIUM
-
-**Where:** `main.cpp:537`, `src/page.h:2965-3040`.
-
-Crow enforces no HTTP body size limit, and `/checkandpush` deserialises an
-attacker-declared structure and then performs, for **every** entry of **every**
-`tx_source.outputs`, a blockchain DB output lookup plus a tx fetch plus a block
-fetch. A single modest request expands into an unbounded number of random DB
-reads and allocations, with no authentication and no rate limiting.
-
-**Fix:** cap the request body, cap `sources`/`outputs` counts before the loop.
-
-## 18. Build produces no hardening and no optimisation — MEDIUM
-
-**Where:** `Dockerfile:53` (`RUN cmake .. && make`), `CMakeLists.txt`.
-
-No `CMAKE_BUILD_TYPE` is set, so the shipped binary is built with **no**
-optimisation flags and, more importantly, none of `-D_FORTIFY_SOURCE=2`,
-`-fstack-protector-strong`, `-fPIE`/`-pie` or `-Wl,-z,relro,-z,now`. The only
-flags in the file are Windows-specific (`CMakeLists.txt:12`).
-
-**Impact:** this is what turns findings 2–6 from "aborts on a canary/fortify
-check" into exploitable primitives. It is not a vulnerability by itself, which is
-why it is listed here rather than above, but it materially raises the severity of
-every memory-safety finding in this report.
-
-**Fix:** set `CMAKE_BUILD_TYPE=Release` and add the hardening flags.
-
-## 19. `rpccalls::get_base_fee_estimate` uses the shared HTTP client unlocked — LOW
-
-Already noted after finding 3: it is the only RPC method that touches
-`m_http_client` without `m_daemon_rpc_mutex` (`src/rpccalls.cpp:44-67`), and it
-assigns `fee_estimate = res.fee` before checking whether the call succeeded.
-Currently unreachable — its only caller (`src/page.h:6952`) is dead code — so it
-is a latent data race rather than a live one.
-
-## 20. Template file re-read from disk on every request — LOW
-
-**Where:** `src/page.h:7003`, `get_footer()` calls `xmreg::read(TMPL_FOOTER)` on
-every single page render rather than using the cached `template_file` map that
-every other template goes through. Synchronous file I/O in the request path,
-unauthenticated and unthrottled; also means a footer edited at runtime is picked
-up mid-flight while all other templates are not.
-
----
-
-## Severity summary
-
-| # | Issue | Severity |
-|---|---|---|
-| 1 | Null deref on missing query parameter | Critical |
-| 2 | Missing header-length check → OOB read | Critical |
-| 3 | Attacker-controlled `ecdhInfo` / `additional_tx_pub_keys` index | Critical |
-| 4 | Attacker-controlled `tx_source.outputs` index | Critical |
-| 5 | Attacker-controlled `output_pub_keys` index | Critical |
-| 6 | `size_t` underflow → OOB **write** | Critical |
-| 7 | Private view keys rendered, logged and put in URLs | Critical |
-| 8 | Unterminated `char[10]` → OOB read on front page | Critical |
-| 9 | `MDB_NOLOCK` against a live writer | High |
-| 10 | Exceptions escape Crow handlers | High |
-| 11 | `isprint(char)` UB | Medium |
-| 12 | Emission underflow + ignored returns | Medium |
-| 13 | Wrong catch clause on emission file load | Medium |
-| 14 | Unchecked `gmtime_r` | Medium |
-| 15 | Division by zero on empty chain | Medium |
-| 16 | No CSRF protection on pusher | Medium |
-| 17 | No body/work limits on deserialisation endpoints | Medium |
-| 18 | No build hardening | Medium (multiplier) |
-| 19 | Unlocked shared HTTP client | Low (latent) |
-| 20 | Footer re-read per request | Low |
-
-Findings 1–8 are the exploitable set: unauthenticated remote crash (1), four
-out-of-bounds reads that reach the response body (2, 3, 4, 5), one out-of-bounds
-write (6), and full disclosure of the most sensitive secret the service handles
-(7, 8). 9 and 10 are serious robustness defects with security consequences.
-11–18 are genuine bugs whose exploitability is limited by reachability, and I
-have not classified them as critical because the code does not support that claim.
-
----
-
-# 21. Integer truncation splits the bounds check from the write target — CRITICAL
-
-**This supersedes finding 3, which I under-classified as an out-of-bounds *read*.
-It is an out-of-bounds *write*, and the guard that should stop it is bypassed by a
-32-bit truncation.**
-
-**Where:** `src/page.h:3973-3985` (`POST /checkrawoutputkeys`), with the signature
-at `src/tools.h:246-251`.
-
-```cpp
-bool decode_ringct(const rct::rctSig & rv,
-                   const crypto::public_key pub,
-                   const crypto::secret_key &sec,
-                   unsigned int i,          // <-- 32-bit
-                   rct::key & mask,         // <-- non-const: this is an OUT parameter
-                   uint64_t & amount);
-```
-
-```cpp
-bool r = decode_ringct(tx.rct_signatures,
-                       tx_pub_key,
-                       prv_view_key,
-                       td.m_internal_output_index,                               // (A)
-                       tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask, // (B)
-                       xmr_amount);
-```
-
-`td.m_internal_output_index` is a `uint64_t` deserialised straight from the
-attacker's blob. It is used **twice, at two different widths**:
-
-* **(A)** is passed as `unsigned int i` — silently **truncated to its low 32 bits**.
-* **(B)** indexes `std::vector<rct::ecdhTuple>` with the **full 64 bits**, and the
-  resulting reference is the function's *output* parameter.
-
-Monero's `rct::decodeRctSimple` opens with
-`CHECK_AND_ASSERT_THROW_MES(i < rv.ecdhInfo.size(), "Bad index")` and later
-performs `mask = ecdh_info.mask;`. So **the value that is validated and the value
-that selects the memory being written are different numbers.** The bounds check
-guards `i`; the write goes through a reference the caller already computed from
-the untruncated index.
-
-### The two primitives, from one field
-
-**Out-of-bounds write.** Set `m_internal_output_index = 0x0000_0001_0000_0000`.
-The truncated `i` is `0`, which passes `0 < ecdhInfo.size()`, so no exception is
-thrown — and then 32 bytes are written to
-`ecdhInfo.data() + 0x1_0000_0000 * sizeof(ecdhTuple)`. The high 32 bits are free,
-so the displacement is any multiple of 2^32 × 64 = 256 GiB.
-
-**Arbitrary-offset read with a response-visible oracle.** Make the truncated `i`
-*invalid* instead (low 32 bits ≥ `ecdhInfo.size()`). The first call now throws
-inside monero, is swallowed by `catch (...)` in `decode_ringct`
-(`src/tools.cpp:974`), and returns `false` — which means `r == false`, so the
-`r = r || decode_ringct(...)` short-circuit **does** evaluate the second call.
-That one reads `additional_tx_pub_keys[td.m_internal_output_index]` **by value**
-with no truncation and no check anywhere: a 32-byte read at `base + 32 * k` for
-any attacker-chosen `k`. The bytes become `pub`, are fed to
-`generate_key_derivation`, and whether that succeeds — plus any decoded amount —
-is reflected in the response. That is a byte-granular probe of process memory.
-
-Both are reachable in a single unauthenticated POST. The attacker supplies the
-view key that authenticates their own blob, so nothing about this requires a
-victim.
-
-### Impact
-
-Remote, unauthenticated, attacker-directed **memory corruption**, plus an
-arbitrary-offset read oracle over the same address space that holds other users'
-submitted view keys. A segmentation fault is *not* a C++ exception, so Crow's
-worker-loop `catch (std::exception&)` (`ext/crow_all.h:11045`) does not contain
-it — unlike most other findings in this report, this one kills the process.
-
-**Honest scoping of the write:** because the displacement is quantised to 256 GiB
-steps, an attacker cannot practically aim it at a chosen heap object on 64-bit —
-in nearly all cases it lands unmapped and the process dies. So the dependable
-outcome is a guaranteed remote crash, with the *read* primitive being the
-precisely controllable one. I am not claiming a demonstrated path to code
-execution. It is still the most serious issue in this report: it is the only
-finding that writes to attacker-chosen memory, and it defeats an upstream bounds
-check that was put there specifically to prevent this.
-
-### Fix
-
-```cpp
-if (td.m_internal_output_index >= tx.rct_signatures.ecdhInfo.size())
-    { /* error out */ }
-if (td.m_internal_output_index >= additional_tx_pub_keys.size())
-    { /* skip the additional-key attempt */ }
-```
-
-and widen `decode_ringct`'s `unsigned int i` to `uint64_t` (or `size_t`) at
-`src/tools.h:250` and `src/tools.cpp:917`/`938` so that no call site can ever
-validate a different value than it dereferences. The width mismatch is the root
-cause; the missing bounds check is what makes it reachable.
-
-**Verification note:** the truncation (`unsigned int i`) and the full-width
-indexing of the out-parameter are both verified directly in this repository. The
-`CHECK_AND_ASSERT_THROW_MES` guard and the `mask = ecdh_info.mask` write are from
-monero's `src/ringct/rctSigs.cpp`, which is not vendored in this checkout —
-confirm them against the monero tree the explorer is built against
-(`v0.18.4.0` per the Dockerfile) before filing upstream.
-
----
-
-# 22. `*min_element()` on an empty vector — null dereference on the tx page — CRITICAL
-
-**Where:** `src/page.h:6641-6642` in `construct_mstch_mixin_timescales()`.
-
-```cpp
-for (const vector<uint64_t>& mixn_timestamps : mixin_timestamp_groups)
-{
-    uint64_t min_found = *min_element(mixn_timestamps.begin(), mixn_timestamps.end());
-    uint64_t max_found = *max_element(mixn_timestamps.begin(), mixn_timestamps.end());
-```
-
-`min_element`/`max_element` return `end()` for an empty range, and dereferencing
-that is undefined behaviour. For a `std::vector` that was never written to,
-`begin() == end() == nullptr`, so this is a straight **null pointer dereference**
-— a segfault, not an exception, so Crow's worker-loop `catch (std::exception&)`
-does not contain it. The process dies.
-
-Nothing in either caller filters empty groups out, and two independent paths
-produce them:
-
-### Path 1 — `/tx/<hash>`, no pusher required
-
-`src/page.h:2413-2437`: the per-ring-member loop `break`s out on the **first**
-`OUTPUT_DNE` from `get_output_tx_and_index`:
-
-```cpp
-for (const uint64_t& abs_offset: absolute_offsets)
-{
-    ...
-    catch (const OUTPUT_DNE& e) { cerr << out_msg << '\n'; break; }
-    ...
-    mixin_timestamps.push_back(blk.timestamp);   // never reached
-}
-mixin_timestamp_groups.push_back(mixin_timestamps);   // pushed anyway — empty
-```
-
-The earlier failure modes in that loop use `continue`, which skips the
-`push_back` and is safe. This one uses `break`, which falls through to it. So an
-input whose *first* ring member fails to resolve — the exact condition the
-neighbouring `are_absolute_offsets_good()` helper exists to detect, and which the
-`MDB_NOLOCK` reader of finding 9 makes more likely — appends an empty group.
-
-This is the ordinary transaction page. It needs only `--enable-mixin-details`
-(the `detailed_view` guard at `src/page.h:6500`), not the pusher.
-
-### Path 2 — `/checkandpush`, fully attacker-controlled
-
-`src/page.h:2965-3040`: `mixin_timestamps` is filled by iterating
-`tx_source.outputs`. That vector comes out of the attacker's deserialised blob,
-so an attacker who submits a `tx_source` with an **empty `outputs`** produces an
-empty group directly, with no dependence on chain state. One unauthenticated POST,
-deterministic crash.
-
-**Impact:** unauthenticated remote denial of service that kills the process, on a
-default-ish configuration. Trivially repeatable — there is no partial-failure or
-race dependence in path 2.
-
-**Fix:** skip empty groups in the min/max loop (and drop them from
-`mixin_timestamp_groups` so the timescale array stays aligned with
-`real_output_indices`), or use the range overloads and handle the empty case.
-
-### Correction to finding 6
-
-I gave "a `tx_source` with an empty `outputs` vector" as the trigger for the
-out-of-bounds write in `mark_real_mixins_on_timescales`. That is the same input
-as path 2 here — and this null dereference happens **first**, inside
-`construct_mstch_mixin_timescales`, which runs at `src/page.h:3054` before
-`mark_real_mixins_on_timescales` at `src/page.h:3068`. So on that specific input
-the process dies here and never reaches the OOB write.
-
-Finding 6 stands as written — `*(r.begin())` is dereferenced unguarded on every
-"not found" result from `boost::find_nth`, not only the underflow case — but its
-reachability via the empty-`outputs` route is blocked by this bug, and fixing
-this one un-blocks it. They must be fixed together, and finding 6 should not be
-closed on the grounds that its trigger "just crashes anyway".
-
----
-
-# File-by-file review
-
-Every source file in the repository, read in full rather than grepped. Files with
-no new findings are recorded too — a clean file is a result.
-
-| File | Lines | Outcome |
-|---|---|---|
-| `main.cpp` | 919 | findings 1, 16 |
-| `src/CmdLineOptions.cpp` / `.h` | 122 / 37 | no memory-safety issues; note below |
-| `src/MicroCore.cpp` | 317 | finding 9 |
-| `src/MicroCore.h` | 92 | clean |
-| `src/CurrentBlockchainStatus.cpp` | 322 | findings 12, 13 |
-| `src/CurrentBlockchainStatus.h` | 114 | clean |
-| `src/MempoolStatus.cpp` | 365 | finding 8 |
-| `src/MempoolStatus.h` | 175 | finding 8 (buffers), finding 23 below |
-| `src/rpccalls.cpp` | 436 | findings 19, 25, 26 below |
-| `src/rpccalls.h` | 205 | clean |
-| `src/tools.cpp` | 1320 | findings 11, 14, 27, 28 below |
-| `src/tools.h` | 388 | finding 21 (the `unsigned int i` parameter) |
-| `src/page.h` | 7178 | findings 2–7, 10, 15, 20, 21, 22, 24 below |
-| `src/crypto/rx-slow-hash.c` | 512 | unreachable — see below |
-| `src/monero_headers.h`, `version.h.in` | 45 / 14 | clean |
-| `templates/*.html` | — | no XSS found; see negative results |
-| `Dockerfile`, `CMakeLists.txt` | — | finding 18 |
-
-## 23. `return 0;` from a `std::string` function — LOW (dead code)
-
-**Where:** `src/MempoolStatus.h:102-113`.
-
-```cpp
-static string
-get_status_string(const uint64_t& status)
-{
-    if (status == 1) return CORE_RPC_STATUS_OK;
-    if (status == 2) return CORE_RPC_STATUS_BUSY;
-    // default
-    return 0;              // <-- null pointer constant -> std::string(nullptr)
-}
-```
-
-`0` is a null pointer constant, so this selects `std::string(const char*)` with
-`nullptr` — the same undefined behaviour as finding 1, reached whenever the
-daemon reports a status that is neither `OK` nor `BUSY` (i.e. whenever
-`get_status_uint` returns its `0` default). It is **not** currently exploitable:
-`get_status_string` has no callers anywhere in the tree. Worth fixing before
-someone wires it up, since the wrong-status path is exactly the one a caller
-would hit first.
-
-## 24. Two attacker-controlled halves of one blob indexed against each other — HIGH
-
-**Where:** `src/page.h:3285` and `src/page.h:3369` (`POST /checkandpush`, signed-tx path).
-
-```cpp
-mstch::map tx_context = construct_tx_context(ptx.tx, 1);   // sized by ptx.tx.vin / .vout
+mstch::map tx_context = construct_tx_context(ptx.tx, 1);   // sized by ptx.tx.vin/.vout
 ...
 for (tx_destination_entry& a_dest: ptx.construction_data.splitted_dsts)
     real_ammounts.push_back(...);                          // sized by construction_data
 ...
-for (size_t i = 0; i < outputs.size(); ++i)
-    out_amount_str = xmreg::xmr_amount_to_str(real_ammounts.at(i));   // (a)
-...
-for (mstch::node& input_node: inputs)
-    amount = xmreg::xmr_amount_to_str(real_amounts.at(input_idx));    // (b)
+out_amount_str = xmreg::xmr_amount_to_str(real_ammounts.at(i));   // (a)
+amount         = xmreg::xmr_amount_to_str(real_amounts.at(input_idx));  // (b)
 ```
 
-`ptx.tx` and `ptx.construction_data` are **independent fields of the same
-attacker-supplied `tools::wallet2::pending_tx`**, and nothing cross-validates
-them. `outputs`/`inputs` are sized from the transaction; `real_ammounts`/
-`real_amounts` are sized from the construction data. Submitting a `pending_tx`
-whose `tx` has five inputs and whose `construction_data.sources` is empty makes
-(b) throw `std::out_of_range` on the first iteration; the mismatch for (a) is
-arranged just as easily and is reached for every RingCT output (their amount
-string is `0.000000000`, so `output_amount == 0` holds).
+`ptx.tx` and `ptx.construction_data` are independent fields of the same
+attacker-supplied `pending_tx`, and nothing cross-validates them. Submitting a
+`pending_tx` whose `tx` has five inputs and whose `construction_data.sources` is
+empty makes (b) throw on the first iteration; (a) is arranged just as easily and is
+reached for every RingCT output, whose amount string is `0.000000000`.
 
 This differs from finding 10, where the mismatch was between a container sized by
 the *database* and one sized by the *transaction*. Here both sides come from the
-attacker, in the same blob, so no chain state or timing is needed — it is a
-deterministic one-request trigger.
+attacker in one blob, so no chain state or timing is needed — a deterministic
+one-request trigger.
 
-**Impact:** per finding 10, an escaping exception abandons the request without
-completing the response, hanging the client connection and leaking worker
-capacity. High rather than critical because it does not kill the process.
+**Impact:** per finding 10, an escaping exception hangs the connection. High rather
+than critical because it does not kill the process.
 
 **Fix:** validate `ptx.tx.vin.size() == ptx.construction_data.sources.size()` and
 `ptx.tx.vout.size() == ptx.construction_data.splitted_dsts.size() + 1` before
-rendering, and reject the blob otherwise.
+rendering.
 
-## 25. RPC calls that can hang while holding the shared daemon mutex — MEDIUM
-
-**Where:** `src/rpccalls.cpp:205`, `269`, `330`, `385`.
-
-`get_current_height` and `get_mempool` pass `timeout_time_ms` to
-`invoke_http_json`. `get_network_info`, `get_hardfork_info`,
-`get_dynamic_per_kb_fee_estimate` and `get_block` **omit it**, taking epee's
-default instead — and all four hold `m_daemon_rpc_mutex` across the call.
-
-`get_dynamic_per_kb_fee_estimate` is reachable from a request handler
-(`/api/feeestimate` → `src/page.h:5807`), so a daemon that accepts the connection
-and then stalls parks a Crow worker thread *and* the shared RPC mutex for the
-default timeout, blocking every other RPC user behind it. The explorer already
-computed a `timeout_time_ms` for exactly this purpose; these four call sites just
-don't use it.
-
-**Fix:** pass `timeout_time_ms` at all call sites.
-
-## 26. Daemon RPC transport security hardcoded off — MEDIUM
-
-**Where:** `src/rpccalls.cpp:24-27`.
-
-```cpp
-m_http_client.set_server(daemon_url, login,
-        epee::net_utils::ssl_support_t::e_ssl_support_disabled);
-```
-
-TLS to the daemon is disabled unconditionally, with no command-line option to
-enable it — while `--daemon-login user[:password]` exists and `--daemon-url`
-accepts a remote host. So credentials and every byte of blockchain data cross the
-network in the clear whenever the daemon is not on localhost.
-
-This matters beyond confidentiality: findings 8 and 14 both depend on
-daemon-supplied values, and this makes those values controllable by anyone on the
-path, not just by the daemon operator.
-
-**Fix:** expose the ssl support mode as an option, defaulting to enabled for
-non-loopback daemon URLs.
-
-## 27. Unreachable JSON helpers with `.at(0)` and unsigned underflow — LOW (dead code)
-
-**Where:** `src/tools.cpp:450` and the surrounding `json`-overload family.
-
-```cpp
-mixin_no = _json["vin"].at(0)["key"]["key_offsets"].size() - 1;
-```
-
-`.at(0)` throws `json::out_of_range` on a transaction with no inputs (a coinbase
-tx), and `.size() - 1` underflows to `UINT64_MAX` when `key_offsets` is empty.
-The `.get<uint64_t>()` calls in the same family throw `json::type_error` on a
-missing or wrongly-typed field, and in the `string` overloads that happens
-*outside* the `try` block, which only guards `json::parse`.
-
-Not currently reachable: both live call sites (`src/page.h:6706`,
-`src/MempoolStatus.cpp:183`) use the `transaction` overload, not the `json` one.
-The whole `json`-based family is dead.
-
-## 28. Ignored `parse_hash256` result — LOW (dead code)
-
-**Where:** `src/tools.cpp:57`.
-
-```cpp
-crypto::hash tx_hash;
-parse_hash256(hash_str, tx_hash);   // return value ignored
-tx = core_storage.get_db().get_tx(tx_hash);
-```
-
-On a parse failure `tx_hash` is left uninitialised and is then used as a database
-key. `get_tx_pub_key_from_str_hash` has no callers; dead code.
-
-## Negative results
-
-Things that looked wrong and are not — recorded so they don't get re-audited:
-
-* **`timestamps_time_scale` off-by-one** (`src/tools.cpp:908`):
-  `empty_time[timestamp_place + 1]` looks like a classic one-past-the-end write,
-  but the caller pads the range by ±3600 seconds
-  (`src/page.h:6650-6651`), so `timestamp < timeN` strictly and
-  `timestamp_place ≤ 168` against a 170-char buffer. Not reachable. The same
-  padding makes `interval_length` non-zero, so the division cannot produce
-  `NaN`/`inf` either.
-* **`get_tx_details` coinbase check** (`src/page.h:6720`): `tx.vin.at(0)` is
-  correctly guarded by `tx.vin.size() > 0` on the preceding line.
-* **`additional_derivations[output_idx]`** (`src/page.h:2243`, `5443`, `6001`):
-  properly gated on
-  `txd.additional_pks.size() == txd.output_pub_keys.size()`. This is the check
-  whose absence would have been a serious OOB read, and it is present at all
-  three sites.
-* **`xmreg::decrypt`** (`src/tools.cpp:1053`): the `prefix_size` arithmetic is
-  correctly bounds-checked before the chacha20 call; source and destination
-  ranges stay inside their buffers.
-* **`url_decode`** (`src/tools.cpp:984`): the `%XX` lookahead is correctly
-  guarded by `i + 3 <= in.size()`.
-* **XSS:** all reflected values reach templates through mstch `{{ }}`, which
-  HTML-escapes, and user input additionally passes `remove_bad_chars`
-  (`src/tools.h:345`) restricting it to `[A-Za-z0-9+/=]`. The two `{{{ }}}`
-  unescaped interpolations (`templates/index.html:16`, `index2.html:65`) are fed
-  server-generated HTML from `mempool()`, not user input. No XSS found.
-* **`src/crypto/rx-slow-hash.c`**: RandomX is force-disabled at startup
-  (`main.cpp:108-111` overrides `--enable-randomx` to `false`), so
-  `show_randomx` returns early and none of this file is reachable. Not audited
-  in depth for that reason.
-* **Docker**: the final image drops to a non-root `monero` user
-  (`Dockerfile:76-78`). Good.
-
-## Note on `--daemon-login`
-
-`src/CmdLineOptions.cpp:73` takes `username[:password]` as a command-line
-argument, so the daemon RPC password is visible in `ps` output and
-`/proc/<pid>/cmdline` to every local user. Combined with finding 26 (no TLS),
-these credentials are not well protected at either end. Conventional for this
-class of tool, but worth an environment-variable or file-based alternative.
-
----
-
-# Recheck pass
-
-A second read of every file, with the specific aim of falsifying the earlier
-findings as well as looking for new ones. It produced two new defects and one
-retraction — the retraction matters more than the additions.
-
-## 29. Wrong loop counter indexes the mixin derivation vector — HIGH
+<a name="29"></a>
+## 29. Wrong loop counter indexes a shadowed derivation vector
 
 **Where:** `src/page.h:2591`, in the `--enable-mixin-guess` block of
-`show_my_outputs()` (`/myoutputs`, `/prove`).
+`show_my_outputs()`.
 
 ```cpp
 // 2569 — correct
@@ -959,126 +431,364 @@ auto derivation_to_use = with_additional
         ? additional_derivations[output_idx] : derivation;
 ```
 
-Two different index variables are used against the same vector:
-
-* `output_idx_in_tx` (declared `src/page.h:2539`) is the output index **within the
-  mixin transaction** — correct.
+* `output_idx_in_tx` (declared `src/page.h:2539`) is the output index within the
+  *mixin* transaction — correct.
 * `output_idx` (declared `src/page.h:2213`) is the counter of the loop over the
-  **target transaction's own outputs**, which finished before the
-  `if (enable_mixin_guess)` block opens at `src/page.h:2325`. It therefore holds
-  a stale, terminal value: `txd.output_pub_keys.size()`.
+  *target* transaction's outputs, which finished before the `if (enable_mixin_guess)`
+  block opens at `src/page.h:2325`. It holds the stale terminal value
+  `txd.output_pub_keys.size()`.
 
-The `additional_derivations` referenced at 2591 is not the one `output_idx`
-belongs to. An inner declaration at `src/page.h:2481-2482` **shadows** the outer
-vector and is sized by `mixin_additional_tx_pub_keys.size()` — the *mixin*
-transaction's additional pubkey count. The shadowing is what hides the bug; the
-sibling sites at `src/page.h:2271` and `6024` use `additional_derivations[output_idx]`
-correctly, because there the vector in scope really is the outer one.
+An inner declaration at `src/page.h:2481-2482` **shadows** the outer
+`additional_derivations` and is sized by `mixin_additional_tx_pub_keys.size()`. The
+shadowing is what hides the bug — the sibling sites at `src/page.h:2271` and `6024`
+use `additional_derivations[output_idx]` correctly, because there the vector in
+scope really is the outer one.
 
-Reaching line 2591 requires `with_additional == true`, which requires
-`mixin_additional_tx_pub_keys.size() == output_pub_keys.size()`. So the vector's
-size equals the mixin tx's parsed output count while the index equals the target
-tx's output count. For the overwhelmingly common case — a 2-output transaction
-whose ring member is also a 2-output transaction — the index is exactly `2` into
-a 2-element vector: **out of bounds by one element**.
+Reaching 2591 requires `with_additional`, which requires
+`mixin_additional_tx_pub_keys.size() == output_pub_keys.size()`. So the vector's size
+is the mixin tx's output count while the index is the target tx's output count. For
+the common case — a 2-output transaction whose ring member is also 2-output — the
+index is exactly `2` into a 2-element vector: out of bounds by one element.
 
-**Impact:** a 32-byte heap out-of-bounds read of a `key_derivation`, which is then
-fed to `decode_ringct` to decode an output amount that is rendered in the
-response. It is simultaneously a correctness bug: even when the read happens to
-land in bounds, it uses an unrelated ring member's derivation, so the decoded
-amount and the "is this output mine" determination are wrong.
+**Impact:** 32-byte heap OOB read of a `key_derivation`, fed to `decode_ringct` to
+decode an amount that is rendered in the response. Also a correctness bug: even when
+the read lands in bounds it uses an unrelated ring member's derivation, so the
+decoded amount and the "is this output mine" determination are wrong.
 
-Gated behind `--enable-mixin-guess` (non-default), and the trigger is a user's
-own submitted view key rather than a third party's input, which is why this is
-High rather than Critical.
+High rather than Critical: gated behind `--enable-mixin-guess` (non-default), and the
+trigger is a user's own view key rather than a third party's input.
 
-**Fix:** use `output_idx_in_tx` at line 2591, and rename the shadowing inner
-vector so the two cannot be confused again.
+**Fix:** use `output_idx_in_tx` at 2591, and rename the shadowing inner vector.
 
-## 30. Failed block/tx lookups set an error flag and then keep going — MEDIUM
+---
 
-**Where:** `src/page.h:6432-6458` in `construct_tx_context()`.
+# Medium
+
+<a name="11"></a>
+## 11. `isprint()` called with a plain `char`
+
+`src/tools.cpp:1222`. `char` is signed on x86-64; the `is*` functions are defined
+only for values representable as `unsigned char` or `EOF`, and glibc indexes
+`__ctype_b` at a negative offset otherwise. Every byte an attacker submits reaches
+this via `make_printable()` on the base64-decoded blob (`src/page.h:2799`, `3711`,
+`3857`), and any byte ≥ 0x80 is negative. Benign on glibc, which pads the table for
+exactly this case — hence Medium — but it is UB and other libcs do not pad.
+**Fix:** `isprint(static_cast<unsigned char>(c))`.
+
+<a name="12"></a>
+## 12. Emission monitor: underflow plus ignored error returns
+
+`src/CurrentBlockchainStatus.cpp:112-114`, `136-141` (`--enable-emission-monitor`).
+`current_blockchain_height - blockchain_chunk_gap` wraps when the height is below 3,
+making `calculate_emission_in_blocks` an effectively unbounded loop; inside it,
+`get_block_by_height` and `get_transactions` return values are ignored, so `blk`
+silently retains the previous iteration's contents and its coinbase is counted
+again. **Impact:** a thread spinning at 100% CPU and publishing wrong emission
+figures via `/api/emission`. Requires a near-empty chain. **Fix:** clamp instead of
+subtracting; check both return values.
+
+<a name="13"></a>
+## 13. Wrong exception type caught when loading the emission file
+
+`src/CurrentBlockchainStatus.cpp:218-224`. `strs.at(n)` throws `std::out_of_range`,
+which the `catch (boost::bad_lexical_cast&)` does not catch, so a truncated
+`emission_amount.txt` terminates the process at startup — in code that explicitly
+advertises it handles corruption. A short write during a crash or a full disk
+produces such a file. **Fix:** check `strs.size() >= 4`, or catch `std::exception`.
+
+<a name="14"></a>
+## 14. Unchecked `gmtime_r` result
+
+`src/tools.cpp:171`, `1263`. `gmtime_r` returns `NULL` and leaves the output struct
+untouched when the timestamp cannot be represented; `tmp` is an uninitialised
+automatic, so `strftime` then reads indeterminate `tm_mon`/`tm_wday` and uses them to
+index glibc's month- and day-name arrays. Reachability is the limiting factor: block
+timestamps are consensus-bounded and mempool receive times come from the local pool,
+so this needs a value from the daemon RPC path. **Fix:** check the return value.
+
+<a name="15"></a>
+## 15. Integer division by zero on an empty blockchain
+
+`src/page.h:621`, `635`. `no_of_last_blocks = std::min(no_blocks_on_index + 1,
+height)` is zero when `height == 0`, and `height / no_of_last_blocks` is then a
+`SIGFPE` on the front page. Only reachable against a freshly initialised database.
+**Fix:** guard the divisor as `json_transactions` already does at `src/page.h:5108`.
+
+<a name="16"></a>
+## 16. No CSRF protection on the pusher endpoint
+
+`main.cpp:537-560`. `POST /checkandpush` with `action=push` relays the submitted
+transaction to the daemon (`rpccalls::commit_tx`) with no token and no
+`Origin`/`Referer` check, so any third-party page can make a visiting browser
+broadcast an attacker-chosen tx blob through this node. **Impact:** the explorer's
+node — and on an onion service, its network identity — originates transactions
+attributable to it on behalf of visitors who never consented. **Fix:** require a
+CSRF token, or at minimum validate `Origin`.
+
+<a name="17"></a>
+## 17. No resource limits on the deserialisation endpoints
+
+`main.cpp:537`, `src/page.h:2965-3040`. Crow enforces no HTTP body size limit, and
+`/checkandpush` deserialises an attacker-declared structure then performs, for every
+entry of every `tx_source.outputs`, a DB output lookup plus a tx fetch plus a block
+fetch. A single modest request expands into an unbounded number of random DB reads,
+unauthenticated and unthrottled. **Fix:** cap the body size and the
+`sources`/`outputs` counts before the loop.
+
+<a name="18"></a>
+## 18. Build produces no hardening and no optimisation
+
+`Dockerfile:53` (`RUN cmake .. && make`), `CMakeLists.txt`. No `CMAKE_BUILD_TYPE` is
+set, so the shipped binary has no optimisation and none of `-D_FORTIFY_SOURCE=2`,
+`-fstack-protector-strong`, `-fPIE`/`-pie` or `-Wl,-z,relro,-z,now`. The only flags
+present are Windows-specific (`CMakeLists.txt:12`). Not a vulnerability in itself,
+but it is what turns findings 2–5 and 21 from "aborts on a fortify check" into
+usable primitives. **Fix:** set `CMAKE_BUILD_TYPE=Release` and add hardening flags.
+
+<a name="25"></a>
+## 25. RPC calls that can hang while holding the shared daemon mutex
+
+`src/rpccalls.cpp:205`, `269`, `330`, `385`. `get_current_height` and `get_mempool`
+pass `timeout_time_ms` to `invoke_http_json`; `get_network_info`,
+`get_hardfork_info`, `get_dynamic_per_kb_fee_estimate` and `get_block` omit it and
+take epee's default — all four while holding `m_daemon_rpc_mutex`.
+`get_dynamic_per_kb_fee_estimate` is reachable from `/api/feeestimate`
+(`src/page.h:5807`), so a daemon that accepts a connection and then stalls parks a
+worker thread *and* the shared mutex. The timeout is already computed; these sites
+just don't use it. **Fix:** pass `timeout_time_ms` everywhere.
+
+<a name="26"></a>
+## 26. Daemon RPC transport security hardcoded off
+
+`src/rpccalls.cpp:24-27` sets `e_ssl_support_disabled` unconditionally, with no
+option to enable it, while `--daemon-login user[:password]` exists and
+`--daemon-url` accepts a remote host. Credentials and all blockchain data cross the
+network in the clear whenever the daemon is not on localhost. This is what makes
+findings 8 and 14 controllable by anyone on the path rather than only by the daemon
+operator. **Fix:** expose the ssl mode, defaulting to enabled for non-loopback URLs.
+
+<a name="30"></a>
+## 30. Failed block/tx lookups set an error flag and then keep going
+
+`src/page.h:6432-6458` in `construct_tx_context()`. Both handlers record
+`context["has_error"] = true` and then fall through to use the object that was never
+populated: `blk` is default-constructed so `blk.timestamp` is 0 and `get_age`
+reports ~56 years, and `mixin_tx` is a default-constructed transaction fed to
+`get_tx_details`. Every other failure path in the same function does
+`return context;`. Not memory-unsafe — both objects are validly constructed, just
+empty — so this renders fabricated ring-member metadata rather than failing. Under
+finding 9's `MDB_NOLOCK` reader these are exactly the lookups expected to fail
+intermittently. **Fix:** `return context;` in both handlers.
+
+---
+
+# Low, latent and dead code
+
+<a name="6"></a>
+## 6. Unguarded `*(r.begin())` write in timescale marking — latent
+
+`src/page.h:6152-6161`.
 
 ```cpp
-if (!mcore->get_block_by_height(output_data.height, blk))
-{
-    context["has_error"] = true;
-    context["error_msg"] = fmt::format("- cant get block of height: {}", ...);
-}   // <-- no return
-
-pair<string, string> mixin_age = get_age(server_timestamp, blk.timestamp, ...);
-...
-if (!mcore->get_tx(tx_out_idx.first, mixin_tx))
-{
-    context["has_error"] = true;
-    ...
-}   // <-- no return
-
-tx_details mixin_txd = get_tx_details(mixin_tx, true);
+size_t no_points = std::count(timescale.begin(), timescale.end(), '*');
+size_t point_to_find = real_output_indices.at(idx);
+if (point_to_find >= no_points)
+    point_to_find = no_points - 1;          // no_points == 0  ->  SIZE_MAX
+boost::iterator_range<string::iterator> r = boost::find_nth(timescale, "*", point_to_find);
+*(r.begin()) = 'R';                          // never checked for "not found"
 ```
 
-Both handlers record the error and then fall through to use the object that was
-never populated. `blk` is a default-constructed block, so `blk.timestamp` is 0 and
-`get_age` reports an age of ~56 years; `mixin_tx` is a default-constructed
-transaction fed to `get_tx_details`. Every other failure path in this same
-function does `return context;` — these two are the exceptions.
+The write through a potentially-empty range is a genuine defect. But after the
+clamp, `point_to_find <= no_points - 1` whenever `no_points >= 1`, so `find_nth`
+always succeeds — **the bug requires `no_points == 0` and nothing else.** That in
+turn requires either an empty mixin group (unreachable: see finding 22) or every
+timestamp in a group failing the range test at `src/tools.cpp:901`, which needs
+`min_mix_timestamp < 3600` so that the `-= 3600` at `src/page.h:6651` underflows.
+A mixin resolving to a block with timestamp 0 — the genesis block — would do it;
+whether the genesis coinbase output is reachable through `get_output_tx_and_index`
+is **unverified**, and it is the only route I can construct.
 
-Not memory-unsafe (both objects are validly constructed, just empty), so this is
-a correctness/robustness defect rather than an exploitable one: the page renders
-fabricated ring-member metadata instead of failing. Under finding 9's
-`MDB_NOLOCK` reader these lookups are exactly the ones expected to fail
-intermittently.
+Downgraded from Critical to latent on that basis. Fix it regardless, together with
+finding 4: `if (no_points == 0) continue;` and check `!r.empty()` before writing.
 
-**Fix:** `return context;` in both handlers, matching the rest of the function.
+<a name="22"></a>
+## 22. `*min_element()` on a possibly-empty range — latent
 
-## Correction: finding 22 is not reachable — downgrade to LOW (latent)
+`src/page.h:6641-6642` in `construct_mstch_mixin_timescales()`.
 
-I claimed two trigger paths for the `*min_element()` null dereference. Rechecking
-both, **neither holds.** The underlying defect is real; my reachability analysis
-was wrong.
+```cpp
+uint64_t min_found = *min_element(mixn_timestamps.begin(), mixn_timestamps.end());
+```
 
-**Path 1 was simply the wrong function.** I cited the `break`-on-`OUTPUT_DNE` at
-`src/page.h:2437` as appending an empty group. That code is inside
-`show_my_outputs()`, and `show_my_outputs()` never calls
-`construct_mstch_mixin_timescales` — the only two call sites are
-`src/page.h:3054` and `src/page.h:6507`. The structurally analogous loop in
-`construct_tx_context()` handles `OUTPUT_DNE` with `return context;`
-(`src/page.h:6425`), not `break`, so it cannot append an empty group either. My
-claim that this was reachable "on the ordinary transaction page, no pusher
-required" was wrong, and that was the most alarming part of the finding.
+`min_element` returns `end()` for an empty range, and for a vector never written to
+`begin() == end() == nullptr`. Neither caller filters empty groups. The defect is
+real; **no reachable trigger exists** — see [Corrections](#corrections). Fix
+alongside finding 4, which is what currently masks it.
 
-**Path 2 is masked by finding 4.** In `show_checkrawtx`, the only way to produce
-an empty group is a `tx_source` whose `outputs` vector is empty. But
-`src/page.h:2917` dereferences `tx_source.outputs[tx_source.real_output]` earlier
-in the *same* loop iteration — on an empty vector that is a null dereference, so
-the process dies at finding 4 before the group is ever pushed. And a *non-empty*
-`outputs` cannot yield an empty group: every failure inside the collection loop
-(`src/page.h:2969-3040`) is a `return`, never a skip, so the timestamp vector is
-either fully populated or the handler has already returned.
+<a name="19"></a>
+## 19. Unlocked shared HTTP client — dead code
 
-**Revised status:** `construct_mstch_mixin_timescales` genuinely dereferences
-`min_element`/`max_element` without checking for an empty range, and it should be
-fixed. But I cannot demonstrate a reachable trigger, so it is LOW/latent, not
-Critical. It becomes reachable if finding 4 is fixed by clamping or skipping the
-bad index rather than rejecting the request — so fix finding 4 by **rejecting**,
-and fix this one at the same time.
+`src/rpccalls.cpp:44-67`. `get_base_fee_estimate` is the only RPC method touching
+`m_http_client` without `m_daemon_rpc_mutex`, and it assigns `fee_estimate = res.fee`
+before checking success. Its only caller (`src/page.h:6952`) is itself dead, so this
+is a latent data race rather than a live one.
 
-The note I attached to finding 6 also depended on path 2 and is withdrawn with
-it: finding 6's own reachability argument (`*(r.begin())` is dereferenced
-unguarded on every "not found" result from `boost::find_nth`) does not depend on
-the empty-`outputs` route and still stands.
+<a name="23"></a>
+## 23. `return 0;` from a `std::string` function — dead code
 
-## Additional instance of finding 10
+`src/MempoolStatus.h:102-113`. `0` is a null pointer constant, selecting
+`std::string(const char*)` with `nullptr` — the same UB as finding 1, on the path
+taken whenever the daemon reports a status that is neither `OK` nor `BUSY`.
+`get_status_string` has no callers. Worth fixing before someone wires it up, since
+the wrong-status path is the first one a caller would hit.
 
-`src/page.h:1626`, in `show_ringmemberstx_hex()` (`/ringmemberstxhex/<hash>`,
-`--enable-as-hex`), throws `std::runtime_error` directly from a route handler
-when a ring member's transaction cannot be fetched. Unlike the `.at()` cases this
-is a deliberate throw, but the consequence is identical: it unwinds into the asio
-worker loop, the response is never completed, and the connection hangs.
+<a name="27"></a>
+## 27. `.at(0)` and unsigned underflow in JSON helpers — dead code
 
-## Revised severity summary
+`src/tools.cpp:450` and the surrounding `json`-overload family.
+`_json["vin"].at(0)` throws on a transaction with no inputs (a coinbase tx), and
+`.size() - 1` underflows to `UINT64_MAX` on empty `key_offsets`. The `.get<uint64_t>()`
+calls throw `json::type_error` on missing fields, outside the `try` that guards only
+`json::parse`. Both live call sites (`src/page.h:6706`, `src/MempoolStatus.cpp:183`)
+use the `transaction` overload; the whole `json` family is dead.
 
-Net effect of the recheck: one High added (29), one Medium added (30), and
-finding 22 drops from Critical to Low. **Nine findings remain genuinely
-critical: 1, 2, 4, 5, 6, 7, 8, 21** — with 21 (the truncation-split bounds check)
-the most serious, and 3 folded into it.
+<a name="28"></a>
+## 28. Ignored `parse_hash256` result — dead code
+
+`src/tools.cpp:57`. On parse failure `tx_hash` is left uninitialised and used as a
+database key. `get_tx_pub_key_from_str_hash` has no callers.
+
+<a name="20"></a>
+## 20. Footer template re-read from disk per request
+
+`src/page.h:7003`. `get_footer()` calls `xmreg::read(TMPL_FOOTER)` on every page
+render instead of using the cached `template_file` map that every other template
+goes through — synchronous file I/O in the request path, unauthenticated and
+unthrottled.
+
+---
+
+# Negative results
+
+Checked and found **not** vulnerable. Recorded so they are not re-audited.
+
+* **`timestamps_time_scale` off-by-one** (`src/tools.cpp:908`):
+  `empty_time[timestamp_place + 1]` looks like a textbook one-past-the-end write, but
+  the caller pads the range by ±3600 seconds (`src/page.h:6650-6651`), so
+  `timestamp < timeN` strictly and `timestamp_place <= 168` against a 170-char
+  buffer. The same padding makes `interval_length` non-zero, so the division cannot
+  produce `NaN`/`inf` either.
+* **`get_tx_details` coinbase check** (`src/page.h:6720`): `tx.vin.at(0)` is
+  correctly guarded by `tx.vin.size() > 0` on the preceding line.
+* **`additional_derivations[output_idx]`** at `src/page.h:2243`, `5443`, `6001`:
+  properly gated on `txd.additional_pks.size() == txd.output_pub_keys.size()`. Since
+  `tx_extra` pubkey counts are not consensus-tied to output counts, the absence of
+  this check would be a serious OOB read; it is present at all three sites. (The
+  fourth site, `src/page.h:2591`, is finding 29 — a different vector.)
+* **`xmreg::decrypt`** (`src/tools.cpp:1053`): the `prefix_size` arithmetic is
+  correctly bounds-checked before the chacha20 call; source and destination ranges
+  stay inside their buffers.
+* **`url_decode`** (`src/tools.cpp:984`): the `%XX` lookahead is correctly guarded by
+  `i + 3 <= in.size()`.
+* **XSS:** all reflected values reach templates through mstch `{{ }}`, which
+  HTML-escapes, and user input additionally passes `remove_bad_chars`
+  (`src/tools.h:345`), restricting it to `[A-Za-z0-9+/=]`. The two `{{{ }}}`
+  unescaped interpolations (`templates/index.html:16`, `index2.html:65`) are fed
+  server-generated HTML from `mempool()`, not user input. No XSS found.
+* **`src/crypto/rx-slow-hash.c`:** RandomX is force-disabled at startup
+  (`main.cpp:108-111` overrides `--enable-randomx` to `false`), so `show_randomx`
+  returns early and none of this file is reachable. Not audited in depth for that
+  reason — revisit if RandomX is re-enabled.
+* **Docker:** the final image drops to a non-root `monero` user
+  (`Dockerfile:76-78`).
+
+---
+
+<a name="corrections"></a>
+# Corrections
+
+Changes made during verification, and why.
+
+**Finding 3 → superseded by finding 21.** Originally reported as an out-of-bounds
+*read* of `ecdhInfo`/`additional_tx_pub_keys`. It is an out-of-bounds **write**:
+`rct::key& mask` is a non-const out-parameter, and the 32-bit truncation of the
+index parameter means monero's own bounds check validates a different number than
+the one selecting the memory written. Impact class changed; merged into 21.
+
+**Finding 22 → Critical to latent.** Both claimed triggers were wrong.
+*Path 1 was the wrong function*: the cited `break`-on-`OUTPUT_DNE` at
+`src/page.h:2437` is inside `show_my_outputs()`, which never calls
+`construct_mstch_mixin_timescales` — the only two call sites are `src/page.h:3054`
+and `6507`, and the structurally analogous loop in `construct_tx_context()` uses
+`return context;` (`src/page.h:6425`), not `break`. The claim that this was
+reachable "on the ordinary transaction page, no pusher required" was false.
+*Path 2 is masked by finding 4*: the only way to an empty group is an empty
+`tx_source.outputs`, but `src/page.h:2917` dereferences
+`tx_source.outputs[tx_source.real_output]` earlier in the same iteration, so the
+process dies at finding 4 first. A non-empty `outputs` cannot yield an empty group,
+because every failure in the collection loop (`src/page.h:2969-3040`) is a `return`,
+never a skip.
+
+**Finding 6 → Critical to latent.** When 22 was retracted I asserted that 6 "does
+not depend on the empty-outputs route and still stands". That was wrong.
+`boost::find_nth` only fails when `no_points == 0`, because the preceding clamp
+guarantees `point_to_find <= no_points - 1` in every other case — so 6 depends on
+exactly the same empty-timescale precondition as 22, and is masked the same way. The
+one route that does not go through an empty group (the `min_mix_timestamp -= 3600`
+underflow) is unverified.
+
+**Critical count: nine → seven.** The running total said "nine criticals" while
+listing eight items (1, 2, 4, 5, 6, 7, 8, 21) — an arithmetic error. With 6 also
+downgraded, the correct list is **1, 2, 4, 5, 7, 8, 21 — seven**.
+
+**Reachability of finding 22's masking is load-bearing.** Findings 6 and 22 are
+unreachable *only because* finding 4 crashes first. Fixing finding 4 by clamping or
+skipping the out-of-range index, rather than rejecting the request, would make both
+live. They must be fixed together.
+
+---
+
+# File coverage
+
+Every file read in full, twice.
+
+| File | Lines | Findings |
+|---|---|---|
+| `main.cpp` | 919 | 1, 16 |
+| `src/CmdLineOptions.cpp` / `.h` | 122 / 37 | none (see note) |
+| `src/MicroCore.cpp` | 317 | 9 |
+| `src/MicroCore.h` | 92 | none |
+| `src/CurrentBlockchainStatus.cpp` | 322 | 12, 13 |
+| `src/CurrentBlockchainStatus.h` | 114 | none |
+| `src/MempoolStatus.cpp` | 365 | 8 |
+| `src/MempoolStatus.h` | 175 | 8, 23 |
+| `src/rpccalls.cpp` | 436 | 19, 25, 26 |
+| `src/rpccalls.h` | 205 | none |
+| `src/tools.cpp` | 1320 | 11, 14, 27, 28 |
+| `src/tools.h` | 388 | 21 (the `unsigned int i` parameter) |
+| `src/page.h` | 7178 | 2, 4, 5, 6, 7, 10, 15, 20, 21, 22, 24, 29, 30 |
+| `src/crypto/rx-slow-hash.c` | 512 | unreachable — see negative results |
+| `src/monero_headers.h`, `version.h.in` | 45 / 14 | none |
+| `templates/*.html` | — | 7 (viewkey rendering); no XSS |
+| `Dockerfile`, `CMakeLists.txt` | — | 18 |
+
+**Note on `--daemon-login`:** `src/CmdLineOptions.cpp:73` takes
+`username[:password]` as a command-line argument, so the daemon RPC password is
+visible in `ps` and `/proc/<pid>/cmdline` to every local user. Combined with finding
+26 (no TLS) these credentials are unprotected at both ends. Conventional for this
+class of tool, but an environment-variable or file-based alternative would be
+better.
+
+---
+
+# Recommended fix order
+
+1. **21** — the only attacker-directed write; fix both the bounds checks *and* the
+   `unsigned int` parameter width.
+2. **4** — by **rejecting** the request, not clamping. Fix **6** and **22** in the
+   same change, since 4 is what currently masks them.
+3. **5**, **2** — the two OOB reads that reach the response body.
+4. **1** — one line per handler, removes a trivial remote kill.
+5. **7** — no code-path risk, but the highest-value secret in the system.
+6. **18** — a build-config change that raises the cost of everything above.
+7. **9**, **10**, **24**, **29** — then the Medium tier.
