@@ -294,3 +294,261 @@ for **every** entry in **every** `tx_source.outputs`, performs a blockchain DB o
 lookup plus a tx fetch plus a block fetch (`src/page.h:2965-3040`). Crow applies no
 HTTP body size limit, so a single modest request expands into an arbitrary number of
 random DB reads and allocations — unauthenticated CPU/IO/memory amplification.
+
+---
+
+# Findings 9–20
+
+The eight above are the ones I would call unambiguously critical. Continuing the
+sweep through `MicroCore`, `CurrentBlockchainStatus`, `tools.cpp`, the remaining
+`page.h` request paths and the build/deployment config turned up twelve more
+distinct root causes. They are listed with honest severities — several are real
+but not critical, and I have said so rather than inflating them.
+
+## 9. LMDB opened with `MDB_NOLOCK` against a concurrently-written database — HIGH
+
+**Where:** `src/MicroCore.cpp:56-57`.
+
+```cpp
+db_flags |= MDB_RDONLY;
+db_flags |= MDB_NOLOCK;
+```
+
+`MDB_NOLOCK` disables LMDB's reader lock table. The reader therefore never
+registers a read transaction, so `monerod` — writing to the same database at the
+same time — is free to reclaim and overwrite pages that this process is still
+reading through. The explorer then parses that memory as blocks and transactions.
+
+**Impact:** torn reads, structurally invalid blobs and wild lengths flowing into
+the deserialisation paths — sporadic corruption and crashes that look like random
+data errors. This is also a *force multiplier* for findings 2–6: the length and
+index values those paths trust can come from a page that changed underneath them.
+
+**Fix:** drop `MDB_NOLOCK` (keep `MDB_RDONLY`) so the reader participates in the
+lock table.
+
+## 10. Unhandled exceptions escape Crow route handlers — HIGH
+
+**Where:** `src/page.h:6587` (`out_amount_indices.at(output_idx)` in
+`construct_tx_context`) and `src/page.h:2417` (`mixin_outputs.at(count)`), among
+others. Both `.at()` calls sit *outside* any enclosing `try`.
+
+`.at()` throws `std::out_of_range` whenever the DB returns fewer amount indices
+than the tx has outputs, or fewer mixin outputs than absolute offsets. Crow does
+not wrap `handler_->handle()` in a try/catch (`ext/crow_all.h:9647`); the
+exception unwinds into the asio worker loop, which catches it and logs
+`"Worker Crash: An uncaught exception occurred"` (`ext/crow_all.h:11045`).
+
+**Impact:** the request is abandoned mid-flight — `res.complete_request_handler_`
+is never invoked, so the response is never completed and the client's connection
+is left hanging until timeout. Repeated triggering leaks connections and worker
+capacity. Note this also *caps* the impact of several exception-throwing bugs
+elsewhere in this report: they hang a connection rather than killing the process.
+The null-pointer deref in finding 1 is not an exception and does still kill it.
+
+**Fix:** wrap route bodies in a try/catch that returns a 500, and bounds-check
+before `.at()`.
+
+## 11. `isprint()` called with a plain `char` — MEDIUM
+
+**Where:** `src/tools.cpp:1222`, inside `make_printable()`.
+
+```cpp
+for (char c: in_s)
+    if (isprint(c))
+```
+
+`char` is signed on x86-64. The `is*` functions are only defined for values
+representable as `unsigned char` or `EOF`; passing a negative value is undefined
+behaviour and, in glibc, indexes the `__ctype_b` table at a negative offset.
+
+Every byte an attacker submits reaches this: `make_printable(decoded_raw_tx_data
+.substr(0, magiclen))` runs on the base64-decoded blob on every `/checkandpush`,
+`/checkrawkeyimgs` and `/checkrawoutputkeys` request (`src/page.h:2799`, `3711`,
+`3857`), and any byte ≥ 0x80 is negative.
+
+**Impact:** out-of-bounds table read on attacker-controlled input. Benign in
+practice on glibc (the table is deliberately padded for this case), which is why
+this is medium and not critical — but it is UB and other libcs are not padded.
+
+**Fix:** `isprint(static_cast<unsigned char>(c))`.
+
+## 12. Emission monitor: underflow plus ignored error returns — MEDIUM
+
+**Where:** `src/CurrentBlockchainStatus.cpp:112-114` and `136-141`
+(`--enable-emission-monitor`).
+
+```cpp
+end_block = end_block > current_blockchain_height
+            ? current_blockchain_height - blockchain_chunk_gap   // underflows
+            : end_block;
+...
+mcore->get_block_by_height(start_blk, blk);      // return value ignored
+core_storage->get_transactions(blk.tx_hashes, txs, missed_txs);   // ignored
+```
+
+When `current_blockchain_height < blockchain_chunk_gap` (3) the subtraction wraps
+to ~2^64 and `calculate_emission_in_blocks(blk_no, ~2^64)` becomes an effectively
+unbounded loop. Inside it, the failed `get_block_by_height` is not checked, so
+`blk` silently retains the *previous* iteration's contents and its coinbase is
+counted again — `emission_calculated.coinbase += coinbase_amount - tx_fee_amount`
+then accumulates garbage (and can itself wrap).
+
+**Impact:** a background thread spinning at 100% CPU indefinitely and publishing
+wrong emission figures via `/api/emission`. Requires a near-empty chain, so:
+medium.
+
+**Fix:** clamp instead of subtracting, and check both return values.
+
+## 13. Wrong exception type caught when loading the emission file — MEDIUM
+
+**Where:** `src/CurrentBlockchainStatus.cpp:218-224`.
+
+```cpp
+try {
+    emission_loaded.blk_no   = boost::lexical_cast<uint64_t>(strs.at(0));
+    ...  strs.at(3) ...
+} catch (boost::bad_lexical_cast &e) { ... return false; }
+```
+
+`strs.at(n)` throws `std::out_of_range`, which this handler does not catch, so a
+truncated or partially-written `emission_amount.txt` terminates the process at
+startup. The surrounding code explicitly advertises that it handles this case
+("Emission file cant be read, got corrupted or has incorrect format"), so the
+intent is clearly to recover — the wrong catch clause defeats it. A short write
+during a crash or a full disk is enough to produce the file.
+
+**Fix:** check `strs.size() >= 4` first, or catch `std::exception`.
+
+## 14. Unchecked `gmtime_r` result → `strftime` on an indeterminate `struct tm` — MEDIUM
+
+**Where:** `src/tools.cpp:171` and `1263`.
+
+```cpp
+std::tm tmp;
+gmtime_r(t, &tmp);                       // return value not checked
+len = std::strftime(str_buff, TIME_LENGTH, format, &tmp);
+```
+
+`gmtime_r` returns `NULL` and leaves the output struct untouched when the
+timestamp cannot be represented. `tmp` is an uninitialised automatic, so
+`strftime` then reads indeterminate `tm_mon` / `tm_wday` values and uses them to
+index glibc's month- and day-name arrays — an out-of-bounds read.
+
+Reachability is the limiting factor: block timestamps are consensus-bounded and
+mempool receive times come from the local LMDB pool, so this needs a value from
+the daemon RPC path (`--daemon-url` may point at a node you do not control).
+Hence medium.
+
+**Fix:** check the return value and emit a placeholder on failure.
+
+## 15. Integer division by zero on an empty blockchain — MEDIUM
+
+**Where:** `src/page.h:621` and `635`.
+
+```cpp
+uint64_t no_of_last_blocks = std::min(no_blocks_on_index + 1, height);
+...
+{"total_page_no", (height / no_of_last_blocks)},
+```
+
+With `height == 0` the divisor is zero — integer division by zero is `SIGFPE`, an
+immediate process kill, on the front page. Only reachable against a freshly
+initialised/empty database, which is why it is medium rather than critical.
+
+**Fix:** guard the divisor, as `json_transactions` already does
+(`limit > 0 ? height / limit : 0`, `src/page.h:5108`).
+
+## 16. No CSRF protection on the state-changing pusher endpoint — MEDIUM
+
+**Where:** `main.cpp:537-560`, `POST /checkandpush` with `action=push`.
+
+The endpoint accepts a plain form-encoded POST with no token, no `Origin`/
+`Referer` check and no `SameSite` protection, and `action=push` **relays the
+submitted transaction to the daemon** (`rpccalls::commit_tx`). Any third-party
+web page can therefore make a visiting browser broadcast an attacker-chosen tx
+blob through this explorer's node.
+
+**Impact:** the explorer's node (and, on an onion service, its network identity)
+is used to originate transactions attributable to it, on behalf of visitors who
+never consented. Not memory corruption, but a real abuse primitive.
+
+**Fix:** require a CSRF token, or at minimum validate `Origin`.
+
+## 17. No resource limits on the deserialisation endpoints — MEDIUM
+
+**Where:** `main.cpp:537`, `src/page.h:2965-3040`.
+
+Crow enforces no HTTP body size limit, and `/checkandpush` deserialises an
+attacker-declared structure and then performs, for **every** entry of **every**
+`tx_source.outputs`, a blockchain DB output lookup plus a tx fetch plus a block
+fetch. A single modest request expands into an unbounded number of random DB
+reads and allocations, with no authentication and no rate limiting.
+
+**Fix:** cap the request body, cap `sources`/`outputs` counts before the loop.
+
+## 18. Build produces no hardening and no optimisation — MEDIUM
+
+**Where:** `Dockerfile:53` (`RUN cmake .. && make`), `CMakeLists.txt`.
+
+No `CMAKE_BUILD_TYPE` is set, so the shipped binary is built with **no**
+optimisation flags and, more importantly, none of `-D_FORTIFY_SOURCE=2`,
+`-fstack-protector-strong`, `-fPIE`/`-pie` or `-Wl,-z,relro,-z,now`. The only
+flags in the file are Windows-specific (`CMakeLists.txt:12`).
+
+**Impact:** this is what turns findings 2–6 from "aborts on a canary/fortify
+check" into exploitable primitives. It is not a vulnerability by itself, which is
+why it is listed here rather than above, but it materially raises the severity of
+every memory-safety finding in this report.
+
+**Fix:** set `CMAKE_BUILD_TYPE=Release` and add the hardening flags.
+
+## 19. `rpccalls::get_base_fee_estimate` uses the shared HTTP client unlocked — LOW
+
+Already noted after finding 3: it is the only RPC method that touches
+`m_http_client` without `m_daemon_rpc_mutex` (`src/rpccalls.cpp:44-67`), and it
+assigns `fee_estimate = res.fee` before checking whether the call succeeded.
+Currently unreachable — its only caller (`src/page.h:6952`) is dead code — so it
+is a latent data race rather than a live one.
+
+## 20. Template file re-read from disk on every request — LOW
+
+**Where:** `src/page.h:7003`, `get_footer()` calls `xmreg::read(TMPL_FOOTER)` on
+every single page render rather than using the cached `template_file` map that
+every other template goes through. Synchronous file I/O in the request path,
+unauthenticated and unthrottled; also means a footer edited at runtime is picked
+up mid-flight while all other templates are not.
+
+---
+
+## Severity summary
+
+| # | Issue | Severity |
+|---|---|---|
+| 1 | Null deref on missing query parameter | Critical |
+| 2 | Missing header-length check → OOB read | Critical |
+| 3 | Attacker-controlled `ecdhInfo` / `additional_tx_pub_keys` index | Critical |
+| 4 | Attacker-controlled `tx_source.outputs` index | Critical |
+| 5 | Attacker-controlled `output_pub_keys` index | Critical |
+| 6 | `size_t` underflow → OOB **write** | Critical |
+| 7 | Private view keys rendered, logged and put in URLs | Critical |
+| 8 | Unterminated `char[10]` → OOB read on front page | Critical |
+| 9 | `MDB_NOLOCK` against a live writer | High |
+| 10 | Exceptions escape Crow handlers | High |
+| 11 | `isprint(char)` UB | Medium |
+| 12 | Emission underflow + ignored returns | Medium |
+| 13 | Wrong catch clause on emission file load | Medium |
+| 14 | Unchecked `gmtime_r` | Medium |
+| 15 | Division by zero on empty chain | Medium |
+| 16 | No CSRF protection on pusher | Medium |
+| 17 | No body/work limits on deserialisation endpoints | Medium |
+| 18 | No build hardening | Medium (multiplier) |
+| 19 | Unlocked shared HTTP client | Low (latent) |
+| 20 | Footer re-read per request | Low |
+
+Findings 1–8 are the exploitable set: unauthenticated remote crash (1), four
+out-of-bounds reads that reach the response body (2, 3, 4, 5), one out-of-bounds
+write (6), and full disclosure of the most sensitive secret the service handles
+(7, 8). 9 and 10 are serious robustness defects with security consequences.
+11–18 are genuine bugs whose exploitability is limited by reachability, and I
+have not classified them as critical because the code does not support that claim.
