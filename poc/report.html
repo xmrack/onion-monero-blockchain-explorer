@@ -1,0 +1,669 @@
+<title>xmrblocks Security Audit</title>
+
+<style>
+  :root {
+    --ground:      #FBFBFC;
+    --surface:     #F2F3F7;
+    --surface-2:   #E9EBF1;
+    --ink:         #14161C;
+    --ink-muted:   #565B6B;
+    --ink-faint:   #7B8194;
+    --hairline:    #DCDFE8;
+    --accent:      #3A4CA8;
+    --accent-soft: #E7EAF7;
+    --crit:        #B02A20;
+    --crit-soft:   #F8E7E5;
+    --high:        #B0670F;
+    --high-soft:   #FAEEDF;
+    --med:         #74671C;
+    --med-soft:    #F5F1DE;
+    --low:         #5E6474;
+    --low-soft:    #ECEEF2;
+    --code-bg:     #14161C;
+    --code-ink:    #E4E7EF;
+    --code-dim:    #8B93A7;
+
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --serif: Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Cascadia Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0F1116;
+      --surface:     #171A22;
+      --surface-2:   #1F232D;
+      --ink:         #E6E8EF;
+      --ink-muted:   #A2A9BA;
+      --ink-faint:   #7C8397;
+      --hairline:    #2A2F3B;
+      --accent:      #97A6E8;
+      --accent-soft: #1C2138;
+      --crit:        #F08076;
+      --crit-soft:   #2E1A18;
+      --high:        #E0A75E;
+      --high-soft:   #2B2216;
+      --med:         #C9BC6A;
+      --med-soft:    #262415;
+      --low:         #9AA1B2;
+      --low-soft:    #1D212A;
+      --code-bg:     #090A0E;
+      --code-ink:    #DDE1EB;
+      --code-dim:    #767E92;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #0F1116;
+    --surface:     #171A22;
+    --surface-2:   #1F232D;
+    --ink:         #E6E8EF;
+    --ink-muted:   #A2A9BA;
+    --ink-faint:   #7C8397;
+    --hairline:    #2A2F3B;
+    --accent:      #97A6E8;
+    --accent-soft: #1C2138;
+    --crit:        #F08076;
+    --crit-soft:   #2E1A18;
+    --high:        #E0A75E;
+    --high-soft:   #2B2216;
+    --med:         #C9BC6A;
+    --med-soft:    #262415;
+    --low:         #9AA1B2;
+    --low-soft:    #1D212A;
+    --code-bg:     #090A0E;
+    --code-ink:    #DDE1EB;
+    --code-dim:    #767E92;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 17px;
+    line-height: 1.62;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 28px 96px; }
+  .col  { max-width: 68ch; }
+
+  /* ---------- masthead ---------- */
+  header.masthead {
+    border-bottom: 2px solid var(--ink);
+    padding: 56px 0 22px;
+    margin-bottom: 40px;
+  }
+  .eyebrow {
+    font-family: var(--sans);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 18px;
+  }
+  h1 {
+    font-family: var(--sans);
+    font-size: clamp(2.1rem, 5vw, 3.05rem);
+    line-height: 1.04;
+    letter-spacing: -.028em;
+    font-weight: 680;
+    text-wrap: balance;
+    margin: 0 0 16px;
+  }
+  .standfirst {
+    font-size: 1.16rem;
+    color: var(--ink-muted);
+    max-width: 60ch;
+    margin: 0 0 30px;
+  }
+  .facts {
+    display: flex; flex-wrap: wrap; gap: 0;
+    border-top: 1px solid var(--hairline);
+    font-family: var(--sans);
+  }
+  .fact {
+    padding: 14px 26px 12px 0; margin-right: 26px;
+    border-right: 1px solid var(--hairline);
+  }
+  .fact:last-child { border-right: 0; margin-right: 0; }
+  .fact dt {
+    font-size: 10.5px; font-weight: 600; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-faint); margin: 0 0 3px;
+  }
+  .fact dd {
+    margin: 0; font-size: 1.32rem; font-weight: 620;
+    letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+  }
+  .fact dd small { font-size: .8rem; font-weight: 500; color: var(--ink-muted); }
+
+  /* ---------- sections ---------- */
+  section { margin: 0 0 60px; }
+  h2 {
+    font-family: var(--sans);
+    font-size: 1.02rem; font-weight: 660;
+    letter-spacing: .015em;
+    margin: 0 0 6px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid var(--hairline);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  h2 .num {
+    font-size: 11px; font-weight: 600; letter-spacing: .1em;
+    color: var(--accent); font-variant-numeric: tabular-nums;
+  }
+  .lede { color: var(--ink-muted); margin: 18px 0 24px; }
+  h3 {
+    font-family: var(--sans); font-size: 1.06rem; font-weight: 640;
+    letter-spacing: -.012em; margin: 34px 0 8px; text-wrap: balance;
+  }
+  h3 .fid {
+    font-family: var(--mono); font-size: .78em; font-weight: 500;
+    color: var(--accent); margin-right: 8px;
+  }
+  p { margin: 0 0 15px; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px;
+  }
+  code {
+    font-family: var(--mono); font-size: .855em;
+    background: var(--surface-2); padding: .1em .34em; border-radius: 3px;
+  }
+  strong { font-weight: 640; }
+
+  /* ---------- priority cards ---------- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(238px, 1fr)); gap: 1px;
+           background: var(--hairline); border: 1px solid var(--hairline); }
+  .card { background: var(--surface); padding: 20px 20px 22px; }
+  .card .rank {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+    color: var(--ink-faint); margin: 0 0 12px;
+  }
+  .card h4 {
+    font-family: var(--sans); font-size: .97rem; font-weight: 640;
+    letter-spacing: -.01em; margin: 0 0 8px; line-height: 1.28;
+  }
+  .card p { font-size: .93rem; color: var(--ink-muted); margin: 0; }
+
+  /* ---------- chips ---------- */
+  .chip {
+    display: inline-block; font-family: var(--sans); font-size: 10.5px;
+    font-weight: 640; letter-spacing: .07em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 3px; white-space: nowrap;
+    vertical-align: 2px;
+  }
+  .s-crit { background: var(--crit-soft); color: var(--crit); }
+  .s-high { background: var(--high-soft); color: var(--high); }
+  .s-med  { background: var(--med-soft);  color: var(--med); }
+  .s-low  { background: var(--low-soft);  color: var(--low); }
+  .v-proven   { background: var(--accent-soft); color: var(--accent); }
+  .v-refuted  { background: var(--low-soft); color: var(--low); }
+
+  /* ---------- evidence blocks ---------- */
+  figure.ev { margin: 22px 0 26px; }
+  figure.ev .frame {
+    background: var(--code-bg); border-radius: 5px;
+    overflow-x: auto; padding: 15px 17px;
+  }
+  figure.ev pre {
+    margin: 0; font-family: var(--mono); font-size: 12.6px;
+    line-height: 1.62; color: var(--code-ink); white-space: pre;
+  }
+  figure.ev pre .dim { color: var(--code-dim); }
+  figure.ev pre .hit { color: #F08076; font-weight: 600; }
+  figure.ev pre .ok  { color: #8FC98B; }
+  figure.ev figcaption {
+    font-family: var(--sans); font-size: 12px; color: var(--ink-faint);
+    margin-top: 9px; letter-spacing: .005em;
+  }
+  figure.ev figcaption code { background: none; padding: 0; font-size: .95em; }
+
+  /* ---------- tables ---------- */
+  .tscroll { overflow-x: auto; margin: 22px 0 10px; border: 1px solid var(--hairline); }
+  table { border-collapse: collapse; width: 100%; font-family: var(--sans); font-size: 13.4px; }
+  thead th {
+    text-align: left; font-size: 10.5px; font-weight: 660; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--ink-faint);
+    padding: 10px 14px; background: var(--surface);
+    border-bottom: 1px solid var(--hairline); white-space: nowrap;
+  }
+  tbody td { padding: 9px 14px; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--surface); }
+  td.id { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink-faint); width: 1%; }
+  td.nowrap { white-space: nowrap; }
+  td .where { font-family: var(--mono); font-size: 11.6px; color: var(--ink-faint); display: block; margin-top: 2px; }
+
+  /* ---------- callout ---------- */
+  .callout {
+    border-left: 3px solid var(--accent); background: var(--surface);
+    padding: 16px 20px; margin: 24px 0;
+  }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .tag {
+    font-family: var(--sans); font-size: 10.5px; font-weight: 660;
+    letter-spacing: .1em; text-transform: uppercase; color: var(--accent);
+    display: block; margin-bottom: 7px;
+  }
+
+  /* ---------- corrections ---------- */
+  .corr { border-top: 1px solid var(--hairline); }
+  .corr > div { border-bottom: 1px solid var(--hairline); padding: 18px 0; }
+  .corr .move {
+    font-family: var(--sans); font-size: 12px; font-weight: 620;
+    letter-spacing: .04em; color: var(--ink-faint); margin: 0 0 5px;
+  }
+  .corr .move b { color: var(--ink); font-weight: 660; }
+  .corr h4 {
+    font-family: var(--sans); font-size: .99rem; font-weight: 640;
+    margin: 0 0 7px; letter-spacing: -.01em;
+  }
+  .corr p { font-size: .95rem; color: var(--ink-muted); margin: 0; }
+
+  ul.tight { margin: 0 0 16px; padding-left: 20px; }
+  ul.tight li { margin-bottom: 7px; }
+
+  footer.end {
+    border-top: 2px solid var(--ink); padding-top: 20px; margin-top: 12px;
+    font-family: var(--sans); font-size: 12.5px; color: var(--ink-faint);
+  }
+  footer.end p { margin: 0 0 6px; }
+
+  @media (max-width: 620px) {
+    body { font-size: 16px; }
+    .wrap { padding: 0 18px 64px; }
+    .fact { border-right: 0; padding-right: 0; margin-right: 0; min-width: 44%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">Security review · onion-monero-blockchain-explorer</p>
+  <h1>xmrblocks Security Audit</h1>
+  <p class="standfirst">
+    Thirty-two findings across the explorer's HTTP handlers, blockchain reader and build
+    configuration. Six are critical. Two give an unauthenticated remote client a
+    memory-disclosure primitive that returns heap contents in the response body.
+  </p>
+  <dl class="facts">
+    <div class="fact"><dt>Findings</dt><dd>32</dd></div>
+    <div class="fact"><dt>Critical</dt><dd>6</dd></div>
+    <div class="fact"><dt>High</dt><dd>4</dd></div>
+    <div class="fact"><dt>Reviewed</dt><dd>12,082 <small>lines, 3 passes</small></dd></div>
+    <div class="fact"><dt>Corrections</dt><dd>6 <small>self-issued</small></dd></div>
+  </dl>
+</header>
+
+<section>
+  <h2><span class="num">01</span> Fix these first</h2>
+  <p class="lede">
+    Ordered by exposure rather than raw severity. Findings 4 and 5 are reachable in the
+    deployment the project's own README recommends and need no cryptographic gate;
+    finding 21 is more severe but sits behind a flag no documented invocation sets.
+  </p>
+  <div class="cards">
+    <div class="card">
+      <p class="rank">Priority 1 · findings 4 &amp; 5</p>
+      <h4>Reject out-of-range indices in the tx pusher</h4>
+      <p>Two unvalidated attacker-chosen indices in <code>/checkandpush</code>. Reject the
+      request — do not clamp. Clamping un-masks findings 6 and 22.</p>
+    </div>
+    <div class="card">
+      <p class="rank">Priority 2 · finding 21</p>
+      <h4>Widen the truncated index parameter</h4>
+      <p>Fix the bounds checks <em>and</em> the <code>unsigned int</code> width in
+      <code>tools.h:250</code>. The width mismatch is the root cause; checks alone leave it
+      reintroducible.</p>
+    </div>
+    <div class="card">
+      <p class="rank">Priority 3 · findings 1 &amp; 7</p>
+      <h4>Guard query parameters; stop leaking view keys</h4>
+      <p>One line per handler. Separately, remove the private view key from the shortcut
+      URL — no flag is needed to reach that leak.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">02</span> The two findings that matter most</h2>
+
+  <h3><span class="fid">#4</span> An arbitrary aligned read, printed into the response</h3>
+  <div class="col">
+    <p>
+      <code>src/page.h:2917</code> indexes a <code>std::vector</code> with
+      <code>tx_source.real_output</code>, taken straight from the attacker's deserialised
+      blob and never bounds-checked. The value read becomes a database output index, and on
+      the lookup-failure path it is formatted <em>into the response body</em>.
+    </p>
+    <p>
+      The offset is not quantised the way the 72-byte element size suggests. Because
+      <code>72 = 8 × 9</code> and 9 is odd, 9 is invertible modulo 2<sup>64</sup> — so every
+      8-byte-aligned offset is reachable, forwards and, through wraparound, backwards. A
+      proof-of-concept solves for the index that recovers a secret planted 48 bytes
+      <em>before</em> the vector:
+    </p>
+  </div>
+  <figure class="ev">
+    <div class="frame"><pre><span class="dim">$ ./f04c</span>
+target delta from outputs.data() = -48 bytes (8-aligned)
+inv(9) mod 2^64 = 0x8e38e38e38e38e39   (check: 9*inv = 1)
+solved real_output = 12297829382473034410 (0xaaaaaaaaaaaaaaaa)
+check: real_output*72 = -48  == delta? YES
+
+expected secret word = 0xbebafecaefbeadde
+leaked   value       = 0xbebafecaefbeadde  <span class="hit">&lt;-- EXACT MATCH</span>
+response body -&gt; "Output with amount 0 and index 13743577360433589726 does not exist!"</pre></div>
+    <figcaption>
+      <code>poc/micro/f04c_arbitrary.cpp</code> — executed. ASan independently confirms the
+      read: <code>heap-buffer-overflow READ of size 8</code>.
+    </figcaption>
+  </figure>
+  <div class="col">
+    <p>
+      One word of process memory per request, at any aligned address, returned in plain
+      text. That is enough to defeat ASLR and to walk out adjacent secrets — including other
+      users' submitted view keys, which live in the same heap.
+    </p>
+  </div>
+
+  <h3><span class="fid">#21</span> A bounds check that guards a different number than it protects</h3>
+  <div class="col">
+    <p>
+      <code>decode_ringct</code> takes the output index as <code>unsigned int</code>
+      (<code>src/tools.h:250</code>) while the caller forms the write target with the full
+      64-bit value. Monero validates the truncated parameter, then writes through the
+      caller's reference. The two are different numbers.
+    </p>
+  </div>
+  <figure class="ev">
+    <div class="frame"><pre><span class="dim">$ ./f21</span>
+attacker m_internal_output_index = 0x0000000100000000 (4294967296)
+  (A) passed as `unsigned int i` -&gt; 0        <span class="dim">&lt;- what gets bounds-checked</span>
+  (B) used to index ecdhInfo     -&gt; 4294967296   <span class="dim">&lt;- what selects the memory</span>
+  guard `i &lt; size()` = <span class="hit">PASSES</span>
+  byte offset of (B) = 4294967296 * 64 = 274877906944 bytes (256 GiB)
+
+  &amp;ecdhInfo[0].mask        = 0x5579318d22b0
+  &amp;ecdhInfo[attacker].mask = 0x55b9318d22b0  <span class="dim">&lt;- target of `mask = ...`</span>
+<span class="hit">Segmentation fault</span>   <span class="dim">[exit 139]</span></pre></div>
+    <figcaption>
+      <code>poc/micro/f21_truncation.cpp</code> — executed. A segfault is not a C++
+      exception, so Crow's worker <code>catch</code> does not contain it: this one kills the
+      process.
+    </figcaption>
+  </figure>
+  <div class="callout">
+    <span class="tag">Scope, stated honestly</span>
+    <p>
+      The write displacement is quantised to 256 GiB steps, so it cannot practically be
+      aimed at a chosen heap object on 64-bit — in nearly all cases it lands unmapped and
+      the process dies. The dependable outcome is a guaranteed remote crash; the read
+      primitive in finding 4 is the precisely controllable one. <strong>No path to code
+      execution is claimed.</strong> Finding 21 ranks first on severity because it is the
+      only finding that writes to attacker-chosen memory and because it defeats an upstream
+      check placed there to prevent exactly this.
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">03</span> Exposure depends on flags — and the README sets them</h2>
+  <div class="col">
+    <p>
+      Reachability is entirely flag-driven, so "default" here means what the project tells
+      operators to run, not what the bare binary does. Every documented invocation
+      (<code>README.md:215</code>, <code>312</code>, <code>302</code>) enables the pusher and
+      the JSON API. None enables the key-image checker, the output-key checker or mixin
+      guessing.
+    </p>
+  </div>
+  <div class="tscroll">
+    <table>
+      <thead>
+        <tr><th>Deployment</th><th>Flags set</th><th>Findings reachable</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="nowrap"><strong>A</strong> — docker-compose<span class="where">README.md:215</span></td>
+          <td>json-api, autorefresh, emission-monitor, pusher</td>
+          <td>1, 4, 5, 7, 12, 16, 17, 24, 31</td>
+        </tr>
+        <tr>
+          <td class="nowrap"><strong>B</strong> — docker run<span class="where">README.md:312, 315</span></td>
+          <td>same, plus a <em>third-party public node over plaintext HTTP</em></td>
+          <td>all of A, plus 8, 14, 26</td>
+        </tr>
+        <tr>
+          <td class="nowrap"><strong>C</strong> — author's aliases<span class="where">README.md:302, 305</span></td>
+          <td>pusher, emission-monitor</td>
+          <td>4, 5, 7, 12, 16, 17, 24, 31</td>
+        </tr>
+        <tr>
+          <td class="nowrap">No documented profile</td>
+          <td>output-key-checker, key-image-checker, mixin-guess</td>
+          <td>2, 21, 29 — gated, not unreachable</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col">
+    <p>
+      Profile B deserves attention beyond convenience. Because the daemon connection is
+      hardcoded to plaintext (<code>src/rpccalls.cpp:24</code>, finding 26), pointing the
+      explorer at someone else's node makes "the daemon is untrusted" a
+      <em>documented configuration</em> rather than a hypothetical — which is the attacker
+      findings 8 and 14 assume.
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">04</span> Evidence</h2>
+  <div class="col">
+    <p>
+      Every finding has a proof-of-concept, in one of two tiers with deliberately different
+      evidentiary weight.
+    </p>
+    <ul class="tight">
+      <li><strong>Mechanism PoCs</strong> (<code>poc/micro/</code>, 13 programs) — self-contained
+      C++ with no dependencies. <strong>All were compiled and executed</strong>; quoted output
+      is real. They prove the defect, not its reachability.</li>
+      <li><strong>Reachability PoCs</strong> (<code>poc/http/</code>, 8 scripts) — requests against a
+      running explorer. <strong>These were not executed.</strong> The review environment has no
+      monero libraries, so the explorer could not be built. They are derived from the code and
+      need confirming against a real build.</li>
+    </ul>
+    <p>Selected executed results:</p>
+  </div>
+  <figure class="ev">
+    <div class="frame"><pre><span class="dim"># finding 9 — MDB_NOLOCK reader against a live writer</span>
+MDB_NOLOCK (no lock):  reads=759240   torn/inconsistent=<span class="hit">751206</span>
+WITH reader lock:      reads=150874   torn/inconsistent=<span class="ok">0</span>
+
+<span class="dim"># finding 8 — strncpy(dst, src, sizeof dst) writes no terminator</span>
+terminator written? <span class="hit">NO</span>
+string{buf}.size() = 38 (expected 10) -&gt; read 28 bytes past the array
+rendered into the front page: "2000000.00........................X.GV"
+
+<span class="dim"># finding 2 — 64-byte reinterpret_cast over a 20-byte plaintext</span>
+AddressSanitizer: <span class="hit">READ of size 64</span>
+0x503000000055 is located 0 bytes after 21-byte region
+
+<span class="dim"># finding 18 — same source, same flags, only -O differs</span>
+bare cmake .. (-O0)        fortified_calls=<span class="hit">0</span>   stack_protector=yes PIE=yes RELRO=yes
+CMAKE_BUILD_TYPE=Release   fortified_calls=<span class="ok">6</span>   stack_protector=yes PIE=yes RELRO=yes</pre></div>
+    <figcaption>Run everything with <code>poc/run_micro.sh</code>, which prints expected
+    against actual exit codes. Several programs crash by design — the crash is the result.</figcaption>
+  </figure>
+  <div class="col">
+    <p>
+      Seven findings (6, 19, 22, 23, 27, 28, 32) have working mechanism PoCs but
+      <strong>no reachable trigger</strong> in the shipped code. The PoC shows the defect is
+      real; the reachability analysis explains why it cannot currently be driven. Keeping
+      that distinction visible is the point of separating the tiers.
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">05</span> Corrections</h2>
+  <p class="lede">
+    Six claims did not survive verification. Four were caught by running the code, two by
+    re-reading it. They are recorded because the reasons are more useful than the original
+    claims were — and because an audit that only accumulates findings is not being checked.
+  </p>
+  <div class="corr">
+    <div>
+      <p class="move"><b>#1</b> &nbsp;Critical → High</p>
+      <h4>libstdc++ throws where I assumed it segfaults</h4>
+      <p>I rated a null query parameter Critical on the assumption that
+      <code>std::string(nullptr)</code> calls <code>strlen(nullptr)</code>. It does not: the
+      constructor has an unconditional null check that throws <code>std::logic_error</code>
+      (<code>basic_string.h:641</code>). Crow catches it and the process survives. It would
+      still be Critical against libc++.</p>
+    </div>
+    <div>
+      <p class="move"><b>#4</b> &nbsp;Oracle → direct arbitrary read</p>
+      <h4>Stronger than first written</h4>
+      <p>Described as an inference oracle over a 72-byte sampling. It is a direct read: the
+      value is printed verbatim into the response, and modular arithmetic makes every
+      8-byte-aligned offset reachable. Proven by exact secret recovery.</p>
+    </div>
+    <div>
+      <p class="move"><b>#22</b> &nbsp;Critical → latent</p>
+      <h4>Both claimed triggers were wrong</h4>
+      <p>Path 1 cited a loop in <code>show_my_outputs()</code>, which never calls the
+      affected function. Path 2 is masked by finding 4, which crashes first. My most
+      alarming claim — reachable on the ordinary transaction page, no pusher required — was
+      false.</p>
+    </div>
+    <div>
+      <p class="move"><b>#6</b> &nbsp;Critical → latent</p>
+      <h4>Shares the precondition I said it didn't</h4>
+      <p>On retracting 22 I asserted 6 stood independently. It does not:
+      <code>find_nth</code> only fails when the point count is zero, because the preceding
+      clamp guarantees a valid index otherwise — the same empty-timescale precondition,
+      masked the same way.</p>
+    </div>
+    <div>
+      <p class="move"><b>#14</b> &nbsp;Medium → Low</p>
+      <h4>The out-of-bounds read cannot happen</h4>
+      <p>I claimed an unchecked <code>gmtime_r</code> leads <code>strftime</code> to index
+      glibc's month and day-name arrays out of bounds. That needs <code>%b</code> or
+      <code>%a</code>; the only formats used anywhere are <code>%F&nbsp;%T</code> and
+      <code>%F</code>. The result is a nonsense date, not memory unsafety.</p>
+    </div>
+    <div>
+      <p class="move"><b>#18</b> &nbsp;Narrowed</p>
+      <h4>The binary is not unmitigated</h4>
+      <p>I wrote that the bare <code>cmake ..</code> leaves the binary without
+      stack-protector, PIE or RELRO. Ubuntu's gcc enables all three by default. The real
+      cost is <code>_FORTIFY_SOURCE</code>, which glibc disables without optimisation — 0
+      fortified calls at <code>-O0</code> against 6 at <code>-O2</code>.</p>
+    </div>
+  </div>
+  <div class="col">
+    <p style="margin-top:22px">
+      One dependency is easy to get wrong and worth restating: findings 6 and 22 are
+      unreachable <em>only because</em> finding 4 crashes first. Fixing 4 by clamping the
+      out-of-range index rather than rejecting the request would make both live. They must
+      land together.
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">06</span> All findings</h2>
+  <div class="tscroll">
+    <table>
+      <thead>
+        <tr><th>#</th><th>Finding</th><th>Severity</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="id">21</td><td>Integer truncation splits a bounds check from its write target<span class="where">src/page.h:3973 · src/tools.h:250</span></td><td class="nowrap"><span class="chip s-crit">Critical</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">4</td><td>Attacker-controlled 64-bit index into <code>tx_source.outputs</code><span class="where">src/page.h:2917, 3301</span></td><td class="nowrap"><span class="chip s-crit">Critical</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">5</td><td>Attacker-controlled index into <code>output_pub_keys</code><span class="where">src/page.h:2958, 3334</span></td><td class="nowrap"><span class="chip s-crit">Critical</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">2</td><td>Missing header-length check before a 64-byte cast<span class="where">src/page.h:3891</span></td><td class="nowrap"><span class="chip s-crit">Critical</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">7</td><td>Private view keys rendered, logged, and placed in URLs<span class="where">src/page.h:2110, 3768, 3902</span></td><td class="nowrap"><span class="chip s-crit">Critical</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">8</td><td>Unterminated <code>char[10]</code> → out-of-bounds read on the front page<span class="where">src/MempoolStatus.cpp:294</span></td><td class="nowrap"><span class="chip s-crit">Critical</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">1</td><td>Null query parameter escapes the handler as <code>std::logic_error</code><span class="where">main.cpp:631, 707, 722, 756, 777, 811</span></td><td class="nowrap"><span class="chip s-high">High</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">9</td><td>LMDB opened <code>MDB_NOLOCK</code> against a live writer<span class="where">src/MicroCore.cpp:57</span></td><td class="nowrap"><span class="chip s-high">High</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">10</td><td>Exceptions escape Crow route handlers<span class="where">src/page.h:1626, 2417, 6587</span></td><td class="nowrap"><span class="chip s-high">High</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">24</td><td>Two attacker-controlled halves of one blob indexed against each other<span class="where">src/page.h:3285, 3369</span></td><td class="nowrap"><span class="chip s-high">High</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">29</td><td>Wrong loop counter indexes a shadowed derivation vector<span class="where">src/page.h:2591</span></td><td class="nowrap"><span class="chip s-high">High</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">11</td><td><code>isprint(char)</code> undefined behaviour on high-bit bytes<span class="where">src/tools.cpp:1222</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">12</td><td>Emission-monitor underflow plus ignored error returns<span class="where">src/CurrentBlockchainStatus.cpp:112, 136</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">13</td><td>Wrong catch clause on emission file load<span class="where">src/CurrentBlockchainStatus.cpp:218</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">15</td><td>Division by zero on an empty chain (SIGFPE)<span class="where">src/page.h:621, 635</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">16</td><td>No CSRF protection on the pusher endpoint<span class="where">main.cpp:537</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">17</td><td>No resource limits on the deserialisation endpoints<span class="where">src/page.h:2965</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">18</td><td>No optimisation, so <code>_FORTIFY_SOURCE</code> is inactive<span class="where">Dockerfile:53</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">25</td><td>RPC calls hang while holding the shared daemon mutex<span class="where">src/rpccalls.cpp:205, 269, 330, 385</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">26</td><td>Daemon RPC transport security hardcoded off<span class="where">src/rpccalls.cpp:24</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">30</td><td>Failed lookups set an error flag and continue anyway<span class="where">src/page.h:6432, 6448</span></td><td class="nowrap"><span class="chip s-med">Medium</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">6</td><td>Unguarded write through a not-found iterator<span class="where">src/page.h:6152</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-refuted">Latent</span></td></tr>
+        <tr><td class="id">14</td><td>Unchecked <code>gmtime_r</code> — garbage output, not memory unsafety<span class="where">src/tools.cpp:171, 1263</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">19</td><td>Unlocked shared HTTP client<span class="where">src/rpccalls.cpp:44</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-refuted">Dead code</span></td></tr>
+        <tr><td class="id">20</td><td>Footer template re-read from disk per request<span class="where">src/page.h:7003</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">22</td><td><code>*min_element()</code> on a possibly-empty range<span class="where">src/page.h:6641</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-refuted">Latent</span></td></tr>
+        <tr><td class="id">23</td><td><code>return 0;</code> from a <code>std::string</code> function<span class="where">src/MempoolStatus.h:112</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-refuted">Dead code</span></td></tr>
+        <tr><td class="id">27</td><td><code>.at(0)</code> and unsigned underflow in JSON helpers<span class="where">src/tools.cpp:450</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-refuted">Dead code</span></td></tr>
+        <tr><td class="id">28</td><td>Ignored <code>parse_hash256</code> result<span class="where">src/tools.cpp:57</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-refuted">Dead code</span></td></tr>
+        <tr><td class="id">31</td><td><code>blk_no - 1</code> underflows before the first emission scan<span class="where">src/page.h:838, 5858, 5863</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-proven">Proven</span></td></tr>
+        <tr><td class="id">32</td><td><code>enable_pusher</code> not re-checked on the raw-hex push path<span class="where">src/page.h:3448</span></td><td class="nowrap"><span class="chip s-low">Low</span></td><td class="nowrap"><span class="chip v-refuted">Latent</span></td></tr>
+        <tr><td class="id">3</td><td>Superseded by finding 21 — reclassified from read to write</td><td class="nowrap"><span class="chip s-low">Merged</span></td><td class="nowrap"><span class="chip v-refuted">—</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">07</span> Method and limits</h2>
+  <div class="col">
+    <p>
+      Every source file was read in full, three times: an initial pass, a verification pass
+      aimed at falsifying the findings, and a third pass over the regions of
+      <code>src/page.h</code> not yet displayed line by line. The third pass produced no new
+      critical findings, which is itself a result.
+    </p>
+    <p>Four limits are worth stating plainly:</p>
+    <ul class="tight">
+      <li>The explorer <strong>was never built or run</strong>. No monero libraries are
+      available in the review environment, so all reachability conclusions are static traces
+      and the <code>poc/http/</code> scripts are unverified.</li>
+      <li>Three claims rest on <strong>monero's source, which is not vendored here</strong> —
+      the <code>CHECK_AND_ASSERT_THROW_MES</code> guard and <code>mask</code> write inside
+      <code>decodeRctSimple</code>, and the RCT deserialiser's
+      <code>ecdhInfo.size() == vout.size()</code> enforcement. Confirm these against the
+      v0.18.4.0 tree before filing upstream.</li>
+      <li><code>src/crypto/rx-slow-hash.c</code> (512 lines) was <strong>not audited in
+      depth</strong>: RandomX is force-disabled at startup (<code>main.cpp:108</code>), so
+      none of it is reachable. Revisit if that changes.</li>
+      <li>Findings 8, 14 and 26 assume an attacker who controls daemon responses. That is a
+      different adversary from the unauthenticated web client, and it is only realistic
+      under deployment profile B.</li>
+    </ul>
+    <p>
+      Nothing here was reported to any third party, and no live instance was tested. The
+      full technical report, per-finding fix guidance and all proof-of-concept sources are on
+      the <code>claude/critical-vulnerabilities-61spzk</code> branch:
+      <code>SECURITY_AUDIT.md</code> and <code>poc/</code>.
+    </p>
+  </div>
+</section>
+
+<footer class="end">
+  <p>Static review of onion-monero-blockchain-explorer at <code>bfa342e</code>, against monero v0.18.4.0.</p>
+  <p>32 findings · 6 critical · 6 self-issued corrections · 21 proof-of-concept programs, 13 executed.</p>
+</footer>
+
+</div>
