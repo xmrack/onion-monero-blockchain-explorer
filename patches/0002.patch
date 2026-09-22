@@ -1,0 +1,79 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0002] finding 4: bounds-check real_output before indexing the ring
+
+tx_source.real_output is a size_t taken straight from the deserialised blob and
+was used to index tx_source.outputs with no check, in both the unsigned-tx and
+signed-tx paths of /checkandpush.
+
+The read is not merely out of bounds, it is disclosed: on the OUTPUT_DNE path
+the value read is formatted into the response body ("Output with amount X and
+index Y does not exist!"), which reaches the client via main.cpp. Because
+sizeof(output_entry) is 72 = 8*9 and 9 is invertible mod 2^64, every 8-byte
+aligned offset is reachable in both directions, making this an arbitrary
+aligned 64-bit read of the address space, one word per request.
+
+Note the fix REJECTS rather than clamps. Clamping or skipping would let a
+tx_source with an empty `outputs` vector through to
+construct_mstch_mixin_timescales(), which dereferences min_element() on the
+resulting empty mixin group (finding 22), and to mark_real_mixins_on_timescales()
+(finding 6). Those two are currently unreachable only because this code path
+faults first.
+
+Reproducers: poc/micro/f04_f05_oob_read.cpp (ASan), f04c_arbitrary.cpp
+(recovers a planted secret exactly), poc/http/f04_solve_offset.py.
+---
+diff --git a/src/page.h b/src/page.h
+index 5eed1e1..6006e2b 100644
+--- a/src/page.h
++++ b/src/page.h
+@@ -2913,10 +2913,27 @@ show_checkrawtx(string raw_tx_data, string action)
+ 
+                     //cout << "tx_source.real_output: "             << tx_source.real_output << endl;
+                     //cout << "tx_source.real_out_tx_key: "         << tx_source.real_out_tx_key << endl;
+                     //cout << "tx_source.real_output_in_tx_index: " << tx_source.real_output_in_tx_index << endl;
+ 
++                    // real_output indexes `outputs` and arrives from the
++                    // submitted blob. Reject rather than clamp: clamping would
++                    // let a malformed source reach the timescale code below,
++                    // which cannot cope with an empty mixin group.
++                    if (tx_source.real_output >= tx_source.outputs.size())
++                    {
++                        string out_msg = fmt::format(
++                                "Real output index {:d} is out of range "
++                                "({:d} ring members)",
++                                tx_source.real_output,
++                                tx_source.outputs.size());
++
++                        cerr << out_msg << endl;
++
++                        return string(out_msg);
++                    }
++
+                     uint64_t index_of_real_output = tx_source.outputs[tx_source.real_output].first;
+ 
+                     tx_out_index real_toi;
+ 
+                     uint64_t tx_source_amount = (tx_source.rct ? 0 : tx_source.amount);
+@@ -3296,10 +3313,22 @@ show_checkrawtx(string raw_tx_data, string action)
+ 
+             for (const tx_source_entry&  tx_source: ptx.construction_data.sources)
+             {
+                 transaction real_source_tx;
+ 
++                if (tx_source.real_output >= tx_source.outputs.size())
++                {
++                    string out_msg = fmt::format(
++                            "Real output index {:d} is out of range "
++                            "({:d} ring members)",
++                            tx_source.real_output, tx_source.outputs.size());
++
++                    cerr << out_msg << endl;
++
++                    return string(out_msg);
++                }
++
+                 uint64_t index_of_real_output = std::get<0>(tx_source.outputs[tx_source.real_output]);
+ 
+                 uint64_t tx_source_amount = (tx_source.rct ? 0 : tx_source.amount);
+ 
+                 tx_out_index real_toi;

@@ -1,0 +1,80 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0010] finding 10: stop exceptions escaping route handlers
+
+crow does not wrap handler_->handle() in a try/catch. An exception thrown from a
+route unwinds into the asio worker loop, which catches std::exception and logs
+"Worker Crash" -- but res.complete_request_handler_ is never invoked, so the
+response is never completed and the client's connection hangs until timeout.
+Repeated triggering leaks connections and worker capacity.
+
+Three sites:
+
+  * construct_tx_context(): out_amount_indices.at(output_idx) throws whenever the
+    DB returns fewer amount indices than the transaction has outputs. The
+    existing !empty() guard does not cover that case; compare sizes instead.
+  * the ring-member loop: mixin_outputs.at(count) throws when fewer outputs come
+    back than there are absolute offsets. Break out of the ring rather than
+    abandoning the request -- the surrounding code already handles a short ring.
+  * show_ringmemberstx_hex(): threw std::runtime_error outright. Return the
+    message like every other failure path in that function.
+
+A blanket try/catch around each route body would also be reasonable defence in
+depth, but these three are the reachable ones and the targeted fixes keep the
+error text useful.
+---
+diff --git a/src/page.h b/src/page.h
+index 5eed1e1..75cfec9 100644
+--- a/src/page.h
++++ b/src/page.h
+@@ -1623,12 +1623,18 @@ show_ringmemberstx_hex(string const& tx_hash_str)
+ 
+            transaction mixin_tx;
+ 
+            if (!mcore->get_tx(mixin_tx_hash, mixin_tx))
+            {
+-               throw std::runtime_error("Cant get tx: "
+-                                        + pod_to_hex(mixin_tx_hash));
++               // Returning beats throwing: crow does not wrap handler
++               // invocation, so an escaping exception unwinds into the asio
++               // worker loop and the response is never completed.
++               string out_msg = "Cant get tx: " + pod_to_hex(mixin_tx_hash);
++
++               cerr << out_msg << endl;
++
++               return out_msg;
+            }
+ 
+            // serialize tx
+            string tx_hex = epee::string_tools::buff_to_hex_nodelimer(
+                                    t_serializable_object_to_blob(mixin_tx));
+@@ -2412,10 +2418,17 @@ show_my_outputs(string tx_hash_str,
+             // for each found output public key check if its ours or not
+             for (const uint64_t& abs_offset: absolute_offsets)
+             {
+ 
+                 // get basic information about mixn's output
++                if (count >= mixin_outputs.size())
++                {
++                    cerr << "Mixin output " << count << " missing for key image "
++                         << pod_to_hex(in_key.k_image) << '\n';
++                    break;
++                }
++
+                 cryptonote::output_data_t output_data = mixin_outputs.at(count);
+ 
+                 tx_out_index tx_out_idx;
+ 
+                 try
+@@ -6579,11 +6592,11 @@ construct_tx_context(transaction tx, uint16_t with_ring_signatures = 0)
+ 
+         string out_amount_index_str {"N/A"};
+ 
+         // outputs in tx in them mempool dont have yet global indices
+         // thus for them, we print N/A
+-        if (!out_amount_indices.empty())
++        if (output_idx < out_amount_indices.size())
+         {
+             out_amount_index_str
+                     = std::to_string(out_amount_indices.at(output_idx));
+         }
+ 

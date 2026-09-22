@@ -1,0 +1,71 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0003] finding 5: bounds-check real_output_in_tx_index against the source tx
+
+real_output_in_tx_index comes from the submitted blob, while output_pub_keys is
+sized by the on-chain transaction that was just fetched. The two have no
+relationship until one is checked against the other, and neither path did.
+
+This is an independent chain from finding 4: keeping real_output valid (so the
+DB lookup succeeds and the source tx is fetched) and setting only
+real_output_in_tx_index out of range reaches this line directly. Applying the
+finding 4 patch alone does not close it.
+
+The bytes read are rendered back to the client as real_out_pub_key and used in
+the is_real comparison, so this is a direct disclosure rather than an oracle.
+---
+diff --git a/src/page.h b/src/page.h
+index 5eed1e1..c8c9f9f 100644
+--- a/src/page.h
++++ b/src/page.h
+@@ -2953,10 +2953,25 @@ show_checkrawtx(string raw_tx_data, string action)
+ 
+                     tx_details real_txd = get_tx_details(real_source_tx);
+ 
+                     real_output_indices.push_back(tx_source.real_output);
+ 
++                    if (tx_source.real_output_in_tx_index
++                            >= real_txd.output_pub_keys.size())
++                    {
++                        string out_msg = fmt::format(
++                                "Output index {:d} is out of range for source "
++                                "tx {:s} ({:d} outputs)",
++                                tx_source.real_output_in_tx_index,
++                                pod_to_hex(real_txd.hash),
++                                real_txd.output_pub_keys.size());
++
++                        cerr << out_msg << endl;
++
++                        return string(out_msg);
++                    }
++
+                     public_key real_out_pub_key = std::get<0>(real_txd.output_pub_keys[tx_source.real_output_in_tx_index]);
+ 
+                     //cout << "real_txd.hash: "    << pod_to_hex(real_txd.hash) << endl;
+                     //cout << "real_txd.pk: "      << pod_to_hex(real_txd.pk) << endl;
+                     //cout << "real_out_pub_key: " << pod_to_hex(real_out_pub_key) << endl;
+@@ -3329,10 +3344,25 @@ show_checkrawtx(string raw_tx_data, string action)
+                     return string("Cant get tx: " + pod_to_hex(real_toi.first));
+                 }
+ 
+                 tx_details real_txd = get_tx_details(real_source_tx);
+ 
++                if (tx_source.real_output_in_tx_index
++                        >= real_txd.output_pub_keys.size())
++                {
++                    string out_msg = fmt::format(
++                            "Output index {:d} is out of range for source "
++                            "tx {:s} ({:d} outputs)",
++                            tx_source.real_output_in_tx_index,
++                            pod_to_hex(real_txd.hash),
++                            real_txd.output_pub_keys.size());
++
++                    cerr << out_msg << endl;
++
++                    return string(out_msg);
++                }
++
+                 public_key real_out_pub_key
+                         = std::get<0>(real_txd.output_pub_keys[tx_source.real_output_in_tx_index]);
+ 
+                 real_output_pub_keys.push_back(
+                         REMOVE_HASH_BRAKETS(fmt::format("{:s}",real_out_pub_key))

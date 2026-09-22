@@ -1,0 +1,46 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0005] finding 29: index the mixin derivation vector with the mixin index
+
+Inside the --enable-mixin-guess block, `additional_derivations` is shadowed by an
+inner declaration sized by mixin_additional_tx_pub_keys.size(). Line 2569 indexes
+it correctly with output_idx_in_tx; twenty-two lines later the same vector was
+indexed with output_idx -- the counter from the enclosing loop over the target
+transaction's own outputs, which has already finished and therefore holds the
+terminal value txd.output_pub_keys.size().
+
+Reaching the line requires with_additional, which requires
+mixin_additional_tx_pub_keys.size() == output_pub_keys.size(). So the vector's
+size is the mixin tx's output count while the index is the target tx's output
+count: for the common case of a 2-output transaction whose ring member is also
+2-output, that is index 2 into a 2-element vector.
+
+Besides the out-of-bounds read, this is a correctness bug -- even when the index
+happens to land in bounds it selects an unrelated ring member's derivation, so
+the decoded amount and the "is this output mine" determination are both wrong.
+
+Consider also renaming the inner vector; the shadowing is what hid this.
+---
+diff --git a/src/page.h b/src/page.h
+index 5eed1e1..3337c75 100644
+--- a/src/page.h
++++ b/src/page.h
+@@ -2585,12 +2585,18 @@ show_my_outputs(string tx_hash_str,
+                             // initialize with regular amount
+                             uint64_t rct_amount = amount;
+ 
+                             bool r;
+ 
++                            // output_idx_in_tx, not output_idx: the vector in
++                            // scope here is the inner one, sized by this mixin
++                            // transaction's additional pubkeys. output_idx belongs
++                            // to the enclosing loop over the *target* tx's outputs
++                            // and has already run to completion, so it is stale and
++                            // unrelated.
+                             auto derivation_to_use = with_additional
+-                                    ? additional_derivations[output_idx] : derivation;
++                                    ? additional_derivations[output_idx_in_tx] : derivation;
+ 
+                             r = decode_ringct(
+                                         mixin_tx.rct_signatures,
+                                         derivation_to_use,
+                                         output_idx_in_tx,

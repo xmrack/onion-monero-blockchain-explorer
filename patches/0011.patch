@@ -1,0 +1,57 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0011] finding 24: cross-check a pending_tx against its construction data
+
+In the signed-tx path of /checkandpush, tx_context is built from ptx.tx (so its
+"outputs" and "inputs" arrays are sized by vout/vin), while real_ammounts is
+filled from ptx.construction_data.splitted_dsts and real_amounts from
+ptx.construction_data.sources. Those are independent fields of the same
+attacker-supplied pending_tx, and nothing validated them against each other.
+
+A pending_tx whose tx carries five inputs and whose construction_data.sources is
+empty makes real_amounts.at(input_idx) throw on the first iteration;
+real_ammounts.at(i) is arranged just as easily and is reached for every RingCT
+output, whose amount string is "0.000000000".
+
+This differs from finding 10, where the mismatch was between a container sized
+by the database and one sized by the transaction. Here both sides come from the
+submitter in a single blob, so no chain state or timing is involved -- it is a
+deterministic one-request trigger.
+
+Checking once, up front, is cheaper and clearer than guarding each .at().
+---
+diff --git a/src/page.h b/src/page.h
+index 5eed1e1..32d46e5 100644
+--- a/src/page.h
++++ b/src/page.h
+@@ -3261,10 +3261,31 @@ show_checkrawtx(string raw_tx_data, string action)
+             tx_context["outputs_xmr_sum"] = xmreg::xmr_amount_to_str(outputs_xmr_sum);
+ 
+             tx_context.insert({"dest_infos", destination_addresses});
+ 
+             // get reference to inputs array created of the tx
++            // ptx.tx and ptx.construction_data are independent fields of the
++            // same submitted blob: the mstch arrays are sized from the
++            // transaction, real_ammounts/real_amounts from the construction
++            // data, and nothing has cross-checked them.
++            if (ptx.tx.vout.size()
++                    != ptx.construction_data.splitted_dsts.size() + 1
++                || ptx.tx.vin.size()
++                    != ptx.construction_data.sources.size())
++            {
++                return string(
++                        "Transaction and its construction data disagree: "
++                        + std::to_string(ptx.tx.vin.size()) + " inputs / "
++                        + std::to_string(ptx.tx.vout.size()) + " outputs "
++                        "against "
++                        + std::to_string(ptx.construction_data.sources.size())
++                        + " sources / "
++                        + std::to_string(
++                                ptx.construction_data.splitted_dsts.size())
++                        + " destinations");
++            }
++
+             mstch::array& outputs = boost::get<mstch::array>(tx_context["outputs"]);
+ 
+             // show real output amount for ringct outputs.
+             // otherwise its only 0.000000000
+             for (size_t i = 0; i < outputs.size(); ++i)

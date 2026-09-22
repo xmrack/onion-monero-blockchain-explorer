@@ -1,0 +1,46 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0004] finding 2: length-check the output-keys header before casting
+
+show_checkcheckrawoutput() reinterpret_casts the decrypted payload to a 64-byte
+account_public_address without checking that 64 bytes are actually present. The
+sibling key-image handler performs exactly this check already; it was simply
+omitted here.
+
+The submitter controls both the blob and the view key that authenticates it
+(xmreg::decrypt(..., prv_view_key, true) verifies against a key they chose), so
+an authenticated one-byte plaintext is straightforward to produce. The 64 bytes
+read past the end of the heap buffer are then rendered into the response as the
+Monero address, disclosing adjacent heap memory -- which in this process
+includes other users' submitted view keys.
+
+The wording of the error message mirrors the key-image path for consistency.
+
+Reproducer: poc/micro/f02_header_len.cpp (ASan: READ of size 64, 0 bytes after
+a 21-byte region).
+---
+diff --git a/src/page.h b/src/page.h
+index 5eed1e1..5b890e1 100644
+--- a/src/page.h
++++ b/src/page.h
+@@ -3888,10 +3888,21 @@ show_checkcheckrawoutput(string raw_data, string viewkey_str)
+ 
+ 
+     // header is public spend and keys
+     const size_t header_lenght    = 2 * sizeof(crypto::public_key);
+ 
++    if (decoded_raw_data.size() < header_lenght)
++    {
++        string error_msg = fmt::format(
++                "Bad data size from submitted output keys raw data.");
++
++        context["has_error"] = true;
++        context["error_msg"] = error_msg;
++
++        return mstch::render(full_page, context);
++    }
++
+     // get xmr address stored in this key image file
+     const account_public_address* xmr_address =
+             reinterpret_cast<const account_public_address*>(
+                     decoded_raw_data.data());
+ 

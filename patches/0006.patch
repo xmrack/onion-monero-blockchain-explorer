@@ -1,0 +1,160 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0006] finding 7: stop disclosing submitted private view keys
+
+The view key a user submits is the highest-value secret this service handles --
+it grants permanent visibility of every incoming transaction of that wallet.
+It was being disclosed three ways:
+
+  * rendered in full into /checkrawkeyimgs and /checkrawoutputkeys responses
+    ("<h4>Viewkey: {{viewkey}}</h4>" in both templates), landing in browser
+    cache, history and any intermediate proxy. /myoutputs already masks the key
+    before rendering, so this was an inconsistency rather than a decision.
+  * written to stderr on parse failure and on key-derivation failure, so keys
+    accumulate in the service log.
+  * embedded in the "link to this page" shortcut URL, leaking via Referer,
+    browser history and access logs. This one needs no feature flag at all.
+
+Introduces a shared mask_secret() helper and routes all of the above through
+it. The shortcut now links to the bare form; the previous URL form cannot be
+made safe, since the key has to appear in the path for it to work.
+
+Also fixes a precedence bug in the same expression: ?: binds looser than +, so
+the concatenation applied only to the /myoutputs branch and the prove page's
+shortcut collapsed to the bare string "/prove".
+
+NOTE for the maintainer: templates/checkrawkeyimgs.html:18 and
+templates/checkrawoutputkeys.html:16 still say "Viewkey: {{viewkey}}". The value
+is now masked so they are safe as-is, but you may prefer to drop the line.
+---
+diff --git a/src/page.h b/src/page.h
+index 5eed1e1..31f8a59 100644
+--- a/src/page.h
++++ b/src/page.h
+@@ -1963,11 +1963,12 @@ show_my_outputs(string tx_hash_str,
+ 
+     std::vector<crypto::secret_key> multiple_tx_secret_keys;
+ 
+     if (!xmreg::parse_str_secret_key(viewkey_str, multiple_tx_secret_keys))
+     {
+-        cerr << "Cant parse the private key: " << viewkey_str << endl;
++        cerr << "Cant parse the private key: "
++             << mask_secret(viewkey_str) << endl;
+         return string("Cant parse private key: " + viewkey_str);
+     }
+     if (multiple_tx_secret_keys.size() == 1)
+     {
+         prv_view_key = multiple_tx_secret_keys[0];
+@@ -2105,22 +2106,21 @@ show_my_outputs(string tx_hash_str,
+ 
+     // payments id. both normal and encrypted (payment_id8)
+     string pid_str   = pod_to_hex(txd.payment_id);
+     string pid8_str  = pod_to_hex(txd.payment_id8);
+ 
+-    string shortcut_url = tx_prove 
+-                    ? string("/prove") : string("/myoutputs")
+-                          + '/' + tx_hash_str
+-                          + '/' + xmr_address_str
+-                          + '/' + viewkey_str;
+-
++    // The shortcut link used to embed the private view key in the URL, which
++    // leaks it through Referer, browser history and any access log along the
++    // way. Link to the form instead; the user re-enters the key there.
++    //
++    // (The old expression also had a precedence bug: ?: binds looser than +,
++    // so the concatenation applied only to the /myoutputs branch and the prove
++    // shortcut collapsed to the bare string "/prove".)
++    string shortcut_url = tx_prove ? string("/prove") : string("/myoutputs");
+ 
+-    string viewkey_str_partial = viewkey_str;
+ 
+-    // dont show full private keys. Only file first and last letters
+-    for (size_t i = 3; i < viewkey_str_partial.length() - 2; ++i)
+-        viewkey_str_partial[i] = '*';
++    string viewkey_str_partial = mask_secret(viewkey_str);
+ 
+     // initalise page tempate map with basic info about blockchain
+     mstch::map context {
+             {"testnet"              , testnet},
+             {"stagenet"             , stagenet},
+@@ -2169,11 +2169,12 @@ show_my_outputs(string tx_hash_str,
+                                  tx_prove ? multiple_tx_secret_keys[0] : prv_view_key,
+                                  derivation))
+     {
+         cerr << "Cant get derived key for: "  << "\n"
+              << "pub_tx_key: " << pub_key << " and "
+-             << "prv_view_key" << pod_to_hex(unwrap(unwrap(prv_view_key))) << endl;
++             << "prv_view_key " << mask_secret(
++                    pod_to_hex(unwrap(unwrap(prv_view_key)))) << endl;
+ 
+         return string("Cant get key_derivation");
+     }
+ 
+     for (size_t i = 0; i < txd.additional_pks.size(); ++i)
+@@ -2182,11 +2183,12 @@ show_my_outputs(string tx_hash_str,
+                                      tx_prove ? multiple_tx_secret_keys[i + 1] : prv_view_key,
+                                      additional_derivations[i]))
+         {
+             cerr << "Cant get derived key for: "  << "\n"
+                  << "pub_tx_key: " << txd.additional_pks[i] << " and "
+-                 << "prv_view_key" << pod_to_hex(unwrap(unwrap(prv_view_key))) << endl;
++                 << "prv_view_key " << mask_secret(
++                        pod_to_hex(unwrap(unwrap(prv_view_key)))) << endl;
+ 
+             return string("Cant get key_derivation");
+         }
+     }
+ 
+@@ -3763,12 +3765,12 @@ show_checkrawkeyimgs(string raw_data, string viewkey_str)
+     address_parse_info address_info {*xmr_address, false};
+ 
+ 
+     context.insert({"address"        , REMOVE_HASH_BRAKETS(
+             xmreg::print_address(address_info, nettype))});
+-    context.insert({"viewkey"        , REMOVE_HASH_BRAKETS(
+-            fmt::format("{:s}", pod_to_hex(unwrap(unwrap(prv_view_key)))))});
++    context.insert({"viewkey"        , mask_secret(REMOVE_HASH_BRAKETS(
++            fmt::format("{:s}", pod_to_hex(unwrap(unwrap(prv_view_key))))))});
+     context.insert({"has_total_xmr"  , false});
+     context.insert({"total_xmr"      , string{}});
+     context.insert({"key_imgs"       , mstch::array{}});
+ 
+ 
+@@ -3897,11 +3899,12 @@ show_checkcheckrawoutput(string raw_data, string viewkey_str)
+ 
+     address_parse_info address_info {*xmr_address, false, false, crypto::null_hash8};
+ 
+     context.insert({"address"        , REMOVE_HASH_BRAKETS(
+             xmreg::print_address(address_info, nettype))});
+-    context.insert({"viewkey"        , pod_to_hex(unwrap(unwrap(prv_view_key)))});
++    context.insert({"viewkey"        , mask_secret(
++            pod_to_hex(unwrap(unwrap(prv_view_key))))});
+     context.insert({"has_total_xmr"  , false});
+     context.insert({"total_xmr"      , string{}});
+     context.insert({"output_keys"    , mstch::array{}});
+ 
+     mstch::array& output_keys_ctx = boost::get<mstch::array>(context["output_keys"]);
+@@ -6764,10 +6767,24 @@ get_tx_details(const transaction& tx,
+     }
+ 
+     return txd;
+ }
+ 
++// Show only the first and last few characters of a secret. Used everywhere a
++// submitted view key or tx secret key would otherwise be echoed back to the
++// client or written to a log.
++string
++mask_secret(string const& secret)
++{
++    if (secret.length() <= 8)
++        return string(secret.length(), '*');
++
++    return secret.substr(0, 3)
++           + string(secret.length() - 5, '*')
++           + secret.substr(secret.length() - 2);
++}
++
+ void
+ clean_post_data(string& raw_tx_data)
+ {
+     // remove white characters
+     boost::trim(raw_tx_data);

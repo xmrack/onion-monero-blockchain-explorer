@@ -1,0 +1,147 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0001] finding 21: stop a truncated index from guarding a 64-bit write
+
+decode_ringct() took the output index as `unsigned int` while callers formed
+the `mask` out-parameter by indexing rv.ecdhInfo with the full uint64_t. The
+value monero bounds-checks and the value selecting the memory it writes were
+therefore different numbers: an index of 0x100000000 truncates to 0, passes
+`CHECK_AND_ASSERT_THROW_MES(i < rv.ecdhInfo.size())`, and the subsequent
+`mask = ecdh_info.mask` writes 32 bytes 256 GiB past the vector.
+
+Three changes, all needed:
+
+  * widen the parameter to uint64_t in tools.h/tools.cpp, so no call site can
+    ever validate a different value than it dereferences. This is the root
+    cause -- bounds checks alone leave the mismatch available to future callers.
+  * add a central guard in decode_ringct() covering every call site.
+  * bounds-check at the /checkrawoutputkeys call site so the out-of-bounds
+    reference is not formed in the first place, and only attempt the
+    additional-pubkey decode when that vector is actually large enough
+    (it is commonly empty).
+
+Reproducer: poc/micro/f21_truncation.cpp -- guard passes, write SIGSEGVs.
+---
+diff --git a/src/page.h b/src/page.h
+index 5eed1e1..6ae13e4 100644
+--- a/src/page.h
++++ b/src/page.h
+@@ -3968,22 +3968,43 @@ show_checkcheckrawoutput(string raw_data, string viewkey_str)
+             // cointbase txs have amounts in plain sight.
+             // so use amount from ringct, only for non-coinbase txs
+             if (!is_coinbase(tx))
+             {
+ 
++                // m_internal_output_index is attacker-controlled: it arrives
++                // through boost deserialisation of the submitted blob and is not
++                // related to this transaction until checked against it.
++                if (td.m_internal_output_index
++                        >= tx.rct_signatures.ecdhInfo.size())
++                {
++                    string error_msg = fmt::format(
++                            "Output index {:d} is out of range for tx {:s}",
++                            td.m_internal_output_index, pod_to_hex(td.m_txid));
++
++                    context["has_error"] = true;
++                    context["error_msg"] = error_msg;
++
++                    return mstch::render(full_page, context);
++                }
++
+                 bool r = decode_ringct(tx.rct_signatures,
+                                        tx_pub_key,
+                                        prv_view_key,
+                                        td.m_internal_output_index,
+                                        tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask,
+                                        xmr_amount);
+-                r = r || decode_ringct(tx.rct_signatures,
+-                                       additional_tx_pub_keys[td.m_internal_output_index],
+-                                       prv_view_key,
+-                                       td.m_internal_output_index,
+-                                       tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask,
+-                                       xmr_amount);
++
++                if (!r && td.m_internal_output_index
++                              < additional_tx_pub_keys.size())
++                {
++                    r = decode_ringct(tx.rct_signatures,
++                                      additional_tx_pub_keys[td.m_internal_output_index],
++                                      prv_view_key,
++                                      td.m_internal_output_index,
++                                      tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask,
++                                      xmr_amount);
++                }
+ 
+                 if (!r)
+                 {
+                     string error_msg = fmt::format(
+                             "Cant decode RingCT for output: {:s}",
+diff --git a/src/tools.cpp b/src/tools.cpp
+index db5ba18..8185e91 100644
+--- a/src/tools.cpp
++++ b/src/tools.cpp
+@@ -915,11 +915,11 @@ timestamps_time_scale(const vector<uint64_t>& timestamps,
+ 
+ bool
+ decode_ringct(const rct::rctSig& rv,
+               const crypto::public_key pub,
+               const crypto::secret_key &sec,
+-              unsigned int i,
++              uint64_t i,
+               rct::key & mask,
+               uint64_t & amount)
+ {
+     crypto::key_derivation derivation;
+ 
+@@ -935,14 +935,26 @@ decode_ringct(const rct::rctSig& rv,
+ }
+ 
+ bool
+ decode_ringct(rct::rctSig const& rv,
+               crypto::key_derivation const& derivation,
+-              unsigned int i,
++              uint64_t i,
+               rct::key& mask,
+               uint64_t& amount)
+ {
++    // The caller forms `mask` by indexing rv.ecdhInfo with this same i. Check it
++    // here as well as at the call sites: monero's decodeRct* validates the value
++    // it is passed, which is not necessarily the value used to form the
++    // reference it writes through.
++    if (i >= rv.ecdhInfo.size())
++    {
++        cerr << "decode_ringct: output index " << i
++             << " out of range (ecdhInfo.size() = " << rv.ecdhInfo.size()
++             << ")\n";
++        return false;
++    }
++
+     try
+     {
+         crypto::secret_key scalar1;
+ 
+         crypto::derivation_to_scalar(derivation, i, scalar1);
+diff --git a/src/tools.h b/src/tools.h
+index 164d2a1..cd13cbf 100644
+--- a/src/tools.h
++++ b/src/tools.h
+@@ -245,18 +245,18 @@ timestamps_time_scale(const vector<uint64_t>& timestamps,
+ 
+ bool
+ decode_ringct(const rct::rctSig & rv,
+               const crypto::public_key pub,
+               const crypto::secret_key &sec,
+-              unsigned int i,
++              uint64_t i,
+               rct::key & mask,
+               uint64_t & amount);
+ 
+ bool
+ decode_ringct(const rct::rctSig & rv,
+               const crypto::key_derivation &derivation,
+-              unsigned int i,
++              uint64_t i,
+               rct::key & mask,
+               uint64_t & amount);
+ 
+ bool
+ url_decode(const std::string& in, std::string& out);

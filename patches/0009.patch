@@ -1,0 +1,48 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0009] finding 9: drop MDB_NOLOCK so the reader takes part in locking
+
+The blockchain is opened MDB_RDONLY|MDB_NOLOCK while monerod is writing to it.
+MDB_NOLOCK disables LMDB's reader lock table, so this process never registers a
+read transaction and the writer may reclaim pages mid-read. The explorer then
+parses that memory as blocks and transactions.
+
+Beyond the corruption risk on its own, this is a force multiplier: the lengths
+and indices that findings 2-5 trust can come from a page that changed underneath
+them, and the "failed lookup" branches in construct_tx_context (finding 30) are
+exactly the ones this makes fire intermittently.
+
+Measured on a synthetic reader/writer pair: 751206 torn reads out of 759240 with
+MDB_NOLOCK, versus 0 out of 150874 with the lock table active
+(poc/micro/f09_nolock.cpp).
+
+MAINTAINER NOTE: this is the one patch in the set with a runtime cost rather
+than a pure correctness fix. Participating in the lock table means the reader
+touches the shared lock file, so the blockchain directory must be writable by
+the explorer's user even though the DB itself is opened read-only. If the
+explorer is deliberately run against a read-only mount, MDB_NOLOCK cannot simply
+be dropped -- in that configuration the supported answer is to point the
+explorer at the daemon's RPC rather than at the LMDB directly. Please confirm
+which deployment you intend before taking this one.
+---
+diff --git a/src/MicroCore.cpp b/src/MicroCore.cpp
+index b028d1e..c3eb060 100644
+--- a/src/MicroCore.cpp
++++ b/src/MicroCore.cpp
+@@ -52,11 +52,16 @@ MicroCore::init(const string& _blockchain_path, network_type nt)
+     blockchain_path = _blockchain_path;
+ 
+     nettype = nt;
+ 
+     db_flags |= MDB_RDONLY;
+-    db_flags |= MDB_NOLOCK;
++
++    // MDB_NOLOCK is deliberately NOT set. Without the reader lock table this
++    // process never registers a read transaction, so monerod is free to reclaim
++    // and overwrite pages while they are still being read -- which surfaces as
++    // structurally invalid blocks and transactions flowing into the parsing
++    // paths, and as intermittent failures in the ring-member lookups.
+ 
+     BlockchainDB* db = nullptr;
+     db = new BlockchainLMDB();
+ 
+     try

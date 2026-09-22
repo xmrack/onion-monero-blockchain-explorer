@@ -1,0 +1,56 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH 0007] finding 8: NUL-terminate the network_info string buffers
+
+strncpy(dst, src, sizeof dst) writes no terminator when the source is at least
+as long as the destination. block_size_limit_str and block_size_median_str are
+char[10], and the formatted value reaches 10 characters once the daemon reports
+a block_size_limit >= 2,048,000,000 (or a median >= 1,024,000,000).
+
+page.h then does `string {current_network_info.block_size_limit_str}`, so strlen
+runs off the end of the array -- through block_size_median_str, start_time,
+current_hf_version and onwards until it finds a zero byte -- and publishes
+whatever it collected to every visitor of the front page.
+
+The daemon is a trust boundary here: --daemon-url accepts a remote host, the
+connection is plaintext (finding 26), and the README's own recommended docker
+run points at a third-party public node.
+
+snprintf always terminates and truncates instead. Measured: the 10-byte buffer
+produced a 38-character std::string before this change.
+
+Reproducer: poc/micro/f_misc.cpp, section 8.
+---
+diff --git a/src/MempoolStatus.cpp b/src/MempoolStatus.cpp
+index 75d1595..ababe53 100644
+--- a/src/MempoolStatus.cpp
++++ b/src/MempoolStatus.cpp
+@@ -289,20 +289,21 @@ MempoolStatus::read_network_info()
+     local_copy.block_size_median          = rpc_network_info.block_size_median;
+     local_copy.block_weight_limit         = rpc_network_info.block_weight_limit;
+     local_copy.start_time                 = rpc_network_info.start_time;
+ 
+ 
+-    strncpy(local_copy.block_size_limit_str, fmt::format("{:0.2f}",
+-                                             static_cast<double>(
+-                                             local_copy.block_size_limit ) / 2.0 / 1024.0).c_str(),
+-                                             sizeof(local_copy.block_size_limit_str));
++    // snprintf always NUL-terminates; strncpy(dst, src, sizeof dst) does not,
++    // and these values are daemon-supplied so their formatted length is not
++    // under our control.
++    snprintf(local_copy.block_size_limit_str,
++             sizeof(local_copy.block_size_limit_str), "%0.2f",
++             static_cast<double>(local_copy.block_size_limit) / 2.0 / 1024.0);
+ 
+ 
+-    strncpy(local_copy.block_size_median_str, fmt::format("{:0.2f}",
+-                                              static_cast<double>(
+-                                              local_copy.block_size_median) / 1024.0).c_str(),
+-                                              sizeof(local_copy.block_size_median_str));
++    snprintf(local_copy.block_size_median_str,
++             sizeof(local_copy.block_size_median_str), "%0.2f",
++             static_cast<double>(local_copy.block_size_median) / 1024.0);
+ 
+     epee::string_tools::hex_to_pod(rpc_network_info.top_block_hash,
+                                    local_copy.top_block_hash);
+ 
+     local_copy.fee_per_kb                 = fee_estimated;
