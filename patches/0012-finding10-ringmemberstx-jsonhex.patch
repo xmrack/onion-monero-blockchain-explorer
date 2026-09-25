@@ -1,0 +1,54 @@
+From: xmrblocks security audit <security@monerofund.org>
+Subject: [PATCH] finding 10: don't throw out of show_ringmemberstx_jsonhex
+
+This closes the last exception-escape site from finding 10 of the security
+audit. The other sites were fixed in the v18.5.1 update; this one is in
+show_ringmemberstx_jsonhex(), which backs the /ringmemberstxhex/<hash> route
+(main.cpp, gated behind --enable-as-hex). It still throws std::runtime_error
+when a ring member's transaction cannot be fetched.
+
+crow does not wrap handler_->handle() in a try/catch, so the exception
+unwinds into the asio worker loop: it is logged as "Worker Crash", but
+res.complete_request_handler_ is never invoked. The response is therefore
+never completed and the client's connection hangs until timeout; repeated
+requests leak worker capacity.
+
+show_ringmemberstx_jsonhex() returns json and already reports its other
+failures as `return json {"error", ...}` (the get_tx and tx_to_hex paths
+near the top of the function). Do the same here instead of throwing.
+
+Reachability is low -- it requires a ring member whose tx cannot be fetched,
+which the read-only DB-flags change (dropping MDB_NOLOCK, PR #346) makes less
+likely still -- but an unguarded throw escaping a route handler is exactly the
+pattern finding 10 is about, so it is worth closing.
+
+Applies to master at 5d9e37c.
+---
+diff --git a/src/page.h b/src/page.h
+index 2be973b..b85c171 100644
+--- a/src/page.h
++++ b/src/page.h
+@@ -1886,14 +1886,21 @@ show_ringmemberstx_jsonhex(string const& tx_hash_str)
+            auto const& output_index_in_tx = txi.second;
+ 
+            transaction mixin_tx;
+ 
+            if (!mcore->get_tx(mixin_tx_hash, mixin_tx))
+            {
+-               throw std::runtime_error("Cant get tx: "
+-                                        + pod_to_hex(mixin_tx_hash));
++               // Returning beats throwing: crow does not wrap handler
++               // invocation, so an escaping exception unwinds into the asio
++               // worker loop and the response is never completed, leaving the
++               // client's connection hung until timeout. Match this function's
++               // own error idiom (see the get_tx / tx_to_hex failures above).
++               cerr << "Cant get tx: " << pod_to_hex(mixin_tx_hash) << endl;
++
++               return json {"error", "Cant get tx: "
++                                     + pod_to_hex(mixin_tx_hash)};
+            }
+ 
+            // serialize tx
+            string tx_hex = epee::string_tools::buff_to_hex_nodelimer(
+                                    t_serializable_object_to_blob(mixin_tx));
+ 
